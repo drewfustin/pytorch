@@ -5,6 +5,7 @@
 import itertools
 from unittest import skipIf as skipif, SkipTest
 
+
 try:
     import numpy as _np
 
@@ -16,19 +17,18 @@ except ImportError:
 import torch._numpy as tnp
 from torch._numpy import (  # noqa: F401
     array,
-    bool_,  # noqa: F401
+    bool_,
     complex128,
     complex64,
     float32,
     float64,
     inf,
     int16,
-    int32,  # noqa: F401
+    int32,
     int64,
     uint8,
 )
 from torch._numpy.testing import assert_allclose
-
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -46,6 +46,7 @@ uint16 = uint8  # can be anything here, see below
 # np._set_promotion_state('weak')
 
 from pytest import raises as assert_raises
+
 
 unchanged = None
 
@@ -93,7 +94,7 @@ class TestNEP50Table(TestCase):
     def test_nep50_exceptions(self, example):
         old, new = examples[example]
 
-        if new == Exception:
+        if new is Exception:
             with assert_raises(OverflowError):
                 eval(example)
 
@@ -104,7 +105,10 @@ class TestNEP50Table(TestCase):
                 new = old
 
             assert_allclose(result, new, atol=1e-16)
-            assert result.dtype == new.dtype
+            if result.dtype != new.dtype:
+                raise AssertionError(
+                    f"Expected result.dtype == {new.dtype}, got {result.dtype}"
+                )
 
 
 # ### Directly compare to numpy ###
@@ -172,8 +176,12 @@ class TestCompareToNumpy(TestCase):
             if dtype is not None:
                 kwargs = {"dtype": getattr(tnp, dtype.__name__)}
             result = tnp.add(scalar, array, **kwargs).tensor.numpy()
-            assert result.dtype == result_numpy.dtype
-            assert result == result_numpy
+            if result.dtype != result_numpy.dtype:
+                raise AssertionError(
+                    f"Expected result.dtype == {result_numpy.dtype}, got {result.dtype}"
+                )
+            if result != result_numpy:
+                raise AssertionError(f"Expected result == {result_numpy}, got {result}")
 
         finally:
             _np._set_promotion_state(state)
@@ -209,7 +217,10 @@ class TestCompareToNumpy(TestCase):
                 result_numpy = None
 
             if result is not None and result_numpy is not None:
-                assert result.tensor.numpy().dtype == result_numpy.dtype
+                if result.tensor.numpy().dtype != result_numpy.dtype:
+                    raise AssertionError(
+                        f"Expected result dtype == {result_numpy.dtype}, got {result.tensor.numpy().dtype}"
+                    )
 
         finally:
             _np._set_promotion_state(state)

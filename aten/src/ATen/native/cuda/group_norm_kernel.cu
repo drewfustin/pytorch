@@ -38,7 +38,7 @@ __global__ void RowwiseMomentsCUDAKernel(
   using T_ACC = acc_type<T, true>;
   using WelfordType = WelfordData<T_ACC, int64_t>;
   using WelfordOp =
-      WelfordOps<T_ACC, T_ACC, int64_t, thrust::pair<T_ACC, T_ACC>>;
+      WelfordOps<T_ACC, T_ACC, int64_t, std::pair<T_ACC, T_ACC>>;
 
   const int64_t i = blockIdx.x;
   WelfordOp welford_op = {/*correction=*/0, /*take_sqrt=*/false};
@@ -63,9 +63,7 @@ __global__ void RowwiseMomentsCUDAKernel(
         val_shared_ptr);
   }
   if (threadIdx.x == 0) {
-    T_ACC m1;
-    T_ACC m2;
-    thrust::tie(m2, m1) = welford_op.project(val);
+    auto [m2, m1] = welford_op.project(val);
     mean[i] = m1;
     rstd[i] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
   }
@@ -83,7 +81,7 @@ __global__ void ComputeFusedParamsCUDAKernel(
     acc_type<T, true>* a,
     acc_type<T, true>* b) {
   using T_ACC = acc_type<T, true>;
-  const int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t index = ((int64_t) blockIdx.x) * blockDim.x + threadIdx.x;
   if (index < N * C) {
     const int64_t ng = index / (C / group);
     const int64_t c = index % C;
@@ -155,7 +153,7 @@ __global__ void GammaBeta1dBackwardCUDAKernel1(
     T* dgamma,
     T* dbeta) {
   using T_ACC = acc_type<T, true>;
-  const int64_t c = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t c = ((int64_t) blockIdx.x) * blockDim.x + threadIdx.x;
   if (c < C) {
     const int64_t G = group;
     const int64_t D = C / G;
@@ -195,7 +193,7 @@ __global__ void GammaBeta1dBackwardCUDAKernel2(
   using T_ACC = acc_type<T, true>;
   __shared__ T_ACC g_shared[kReduceTileSize][kReduceTileSize + 1];
   __shared__ T_ACC b_shared[kReduceTileSize][kReduceTileSize + 1];
-  const int64_t c = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t c = ((int64_t) blockIdx.x) * blockDim.x + threadIdx.x;
   T_ACC dg_sum1 = 0;
   T_ACC dg_sum2 = 0;
   T_ACC db_sum1 = 0;
@@ -365,7 +363,7 @@ __global__ void GammaBetaBackwardCUDAKernel1(
     T* dgamma,
     T* dbeta) {
   using T_ACC = acc_type<T, true>;
-  const int64_t c = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t c = ((int64_t) blockIdx.x) * blockDim.x + threadIdx.x;
   if (c < C) {
     const int64_t G = group;
     const int64_t D = C / G;
@@ -403,7 +401,7 @@ __global__ void GammaBetaBackwardCUDAKernel2(
   using T_ACC = acc_type<T, true>;
   __shared__ T_ACC g_shared[kReduceTileSize][kReduceTileSize + 1];
   __shared__ T_ACC b_shared[kReduceTileSize][kReduceTileSize + 1];
-  const int64_t c = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t c = ((int64_t) blockIdx.x) * blockDim.x + threadIdx.x;
   T_ACC dg_sum1 = 0;
   T_ACC dg_sum2 = 0;
   T_ACC db_sum1 = 0;
@@ -460,7 +458,7 @@ __global__ void GammaBetaBackwardCUDAKernel2(
     }
   }
 
-  // Do warp reduce for the 2st 16 cols in the tile.
+  // Do warp reduce for the 2nd 16 cols in the tile.
   sum1 = g_shared[threadIdx.x][threadIdx.y + blockDim.y];
   sum2 = b_shared[threadIdx.x][threadIdx.y + blockDim.y];
   sum1 = cuda_utils::WarpReduceSum<T_ACC>(sum1);
@@ -619,7 +617,7 @@ void GroupNormKernelImplInternal(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     auto iter = TensorIteratorConfig()
-                    .check_all_same_dtype(std::is_same<T, T_ACC>::value)
+                    .check_all_same_dtype(std::is_same_v<T, T_ACC>)
                     .resize_outputs(false)
                     .add_owned_output(Y.view({N * C, HxW}))
                     .add_owned_const_input(X.view({N * C, HxW}))
@@ -716,7 +714,7 @@ void GroupNorm1dBackward(
 
     if (gamma.defined()) {
       auto iter = TensorIteratorConfig()
-                      .check_all_same_dtype(std::is_same<T, T_ACC>::value)
+                      .check_all_same_dtype(std::is_same_v<T, T_ACC>)
                       .resize_outputs(false)
                       .add_owned_output(dX.view({N, G, D}))
                       .add_owned_const_input(dY.view({N, G, D}))
@@ -736,7 +734,7 @@ void GroupNorm1dBackward(
           });
     } else {
       auto iter = TensorIteratorConfig()
-                      .check_all_same_dtype(std::is_same<T, T_ACC>::value)
+                      .check_all_same_dtype(std::is_same_v<T, T_ACC>)
                       .resize_outputs(false)
                       .add_owned_output(dX.view({N * G, D}))
                       .add_owned_const_input(dY.view({N * G, D}))
@@ -863,7 +861,7 @@ void GroupNormBackwardKernelImplInternal(
 
     if (gamma.defined()) {
       auto iter = TensorIteratorConfig()
-                      .check_all_same_dtype(std::is_same<T, T_ACC>::value)
+                      .check_all_same_dtype(std::is_same_v<T, T_ACC>)
                       .add_output(c1)
                       .add_owned_const_input(rstd.view({N, G, 1}))
                       .add_owned_const_input(gamma.view({1, G, D}))
@@ -892,7 +890,7 @@ void GroupNormBackwardKernelImplInternal(
 
     if (gamma.defined()) {
       auto iter = TensorIteratorConfig()
-                      .check_all_same_dtype(std::is_same<T, T_ACC>::value)
+                      .check_all_same_dtype(std::is_same_v<T, T_ACC>)
                       .resize_outputs(false)
                       .add_owned_output(dX.view({N * G, D, HxW}))
                       .add_owned_const_input(dY.view({N * G, D, HxW}))
@@ -908,7 +906,7 @@ void GroupNormBackwardKernelImplInternal(
           });
     } else {
       auto iter = TensorIteratorConfig()
-                      .check_all_same_dtype(std::is_same<T, T_ACC>::value)
+                      .check_all_same_dtype(std::is_same_v<T, T_ACC>)
                       .resize_outputs(false)
                       .add_owned_output(dX.view({N * G, D * HxW}))
                       .add_owned_const_input(dY.view({N * G, D * HxW}))
@@ -990,7 +988,7 @@ void GroupNormBackwardKernelImpl(
 
 } // namespace
 
-REGISTER_DISPATCH(GroupNormKernel, &GroupNormKernelImpl);
-REGISTER_DISPATCH(GroupNormBackwardKernel, &GroupNormBackwardKernelImpl);
+REGISTER_DISPATCH(GroupNormKernel, &GroupNormKernelImpl)
+REGISTER_DISPATCH(GroupNormBackwardKernel, &GroupNormBackwardKernelImpl)
 
 } // namespace at::native

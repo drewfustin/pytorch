@@ -11,8 +11,7 @@
 #include <c10/util/irange.h>
 
 namespace at::native::xnnpack {
-namespace internal {
-namespace convolution2d {
+namespace internal::convolution2d {
 
 namespace {
 
@@ -44,9 +43,9 @@ bool available(
          (kFloat == weight.scalar_type()) &&
          // Bias
          (bias_sizes_opt.has_value() ? ((1 == bias_sizes_opt->size()) &&
-                ((transposed ? (weight.size(Layout::Filter::input) ==
+                (transposed ? (weight.size(Layout::Filter::input) ==
                                 ((*bias_sizes_opt)[0] / groups))
-                  : (weight.size(Layout::Filter::output) == ((*bias_sizes_opt)[0])))))
+                  : (weight.size(Layout::Filter::output) == ((*bias_sizes_opt)[0]))))
             : true) &&
          // Padding
          (padding[Layout::Parameter::height] >= 0) &&
@@ -134,10 +133,10 @@ const Tensor reorder_weights_for_transpose_conv(const Tensor& weight_nhwc,
   int kernel_height = weight_nhwc.size(2);
 
   int o_offset = 1;
-  int h_offset = (output_channels_per_group);
-  int w_offset = (output_channels_per_group)*(kernel_height);
-  int i_offset = (output_channels_per_group)*(kernel_height)*(kernel_width);
-  int g_offset = (output_channels_per_group)*(kernel_height)*(kernel_width)*(input_channels_per_group);
+  int h_offset = output_channels_per_group;
+  int w_offset = output_channels_per_group*kernel_height;
+  int i_offset = output_channels_per_group*kernel_height*kernel_width;
+  int g_offset = output_channels_per_group*kernel_height*kernel_width*input_channels_per_group;
 
   Tensor reordered = mobile::empty_with_tail_padding(
      weight_nhwc.sizes(),
@@ -188,7 +187,7 @@ ContextConv2D create(
   TORCH_CHECK(
       available(
           weight_nhwc,
-          (bias.has_value() && bias->defined()) ? at::OptionalIntArrayRef(bias->sizes()) : c10::nullopt,
+          (bias.has_value() && bias->defined()) ? at::OptionalIntArrayRef(bias->sizes()) : std::nullopt,
           padding_expanded,
           stride_expanded,
           dilation_expanded,
@@ -202,10 +201,8 @@ ContextConv2D create(
 
 
   xnn_operator_t convolution_op{};
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  xnn_status create_status;
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
-  std::array<int64_t, 4> weight_sizes;
+  xnn_status create_status{};
+  std::array<int64_t, 4> weight_sizes{};
 
   if (transposed) {
     const Tensor weight_reordered = reorder_weights_for_transpose_conv(weight_nhwc, groups);
@@ -325,8 +322,7 @@ Tensor run(
       padded_input_nhwc.opt_names());
   }
 
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  xnn_status setup_status;
+  xnn_status setup_status{};
 
   /*
    * Input Pointer Caching:
@@ -451,7 +447,7 @@ unpack_prepacked_sizes_conv2d(const IValue& ivalue) {
   const auto& bias = std::get<1>(tuple);
   return IValue(std::make_tuple(
       std::get<0>(tuple).sizes(),
-      (bias && bias->defined()) ? at::OptionalIntArrayRef(bias->sizes()) : c10::nullopt,
+      (bias && bias->defined()) ? at::OptionalIntArrayRef(bias->sizes()) : std::nullopt,
       std::get<2>(tuple),
       std::get<3>(tuple),
       std::get<4>(tuple),
@@ -464,7 +460,6 @@ Tensor conv2d_transpose_clamp_run(
   return op_context->run(input);
 }
 
-} // namespace convolution2d
 } // namespace internal
 
 bool use_convolution2d(

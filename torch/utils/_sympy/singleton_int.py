@@ -2,6 +2,7 @@
 import sympy
 from sympy.multipledispatch import dispatch
 
+
 __all__ = ["SingletonInt"]
 
 
@@ -16,7 +17,7 @@ class SingletonInt(sympy.AtomicExpr):
 
     # The semantics of this class should match that of NestedIntSymNodeImpl in
     # c10/core/NestedIntSymNodeImpl.h
-    def __init__(self, val, *, coeff=1):
+    def __init__(self, val, *, coeff=1) -> None:
         self._val = val
         self._coeff = coeff
         super().__init__()

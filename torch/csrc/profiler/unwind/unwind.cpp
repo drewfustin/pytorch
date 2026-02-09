@@ -1,35 +1,35 @@
+#include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
+#include <c10/util/env.h>
 #include <torch/csrc/profiler/unwind/unwind.h>
-#include <torch/csrc/utils/cpp_stacktraces.h>
-#include <unordered_map>
 
 #if !defined(__linux__) || !defined(__x86_64__) || !defined(__has_include) || \
     !__has_include("ext/stdio_filebuf.h")
 namespace torch::unwind {
 std::vector<void*> unwind() {
-  TORCH_CHECK(
-      false,
+  TORCH_WARN_ONCE(
       "record_context_cpp is not support on non-linux non-x86_64 platforms");
+  return {};
 }
 
 std::optional<std::pair<std::string, uint64_t>> libraryFor(void* addr) {
-  TORCH_CHECK(
-      false,
+  TORCH_WARN_ONCE(
       "record_context_cpp is not support on non-linux non-x86_64 platforms");
+  return {};
 }
 
 #ifndef FBCODE_CAFFE2
 std::vector<Frame> symbolize(const std::vector<void*>& frames, Mode mode) {
-  TORCH_CHECK(
-      false,
+  TORCH_WARN_ONCE(
       "record_context_cpp is not support on non-linux non-x86_64 platforms");
+  return {};
 }
 #endif
 
 Stats stats() {
-  TORCH_CHECK(
-      false,
+  TORCH_WARN_ONCE(
       "record_context_cpp is not support on non-linux non-x86_64 platforms");
+  return {};
 }
 
 } // namespace torch::unwind
@@ -37,6 +37,7 @@ Stats stats() {
 #else
 
 #include <c10/util/flat_hash_map.h>
+#include <dlfcn.h>
 #include <elf.h>
 #include <link.h>
 #include <linux/limits.h>
@@ -45,9 +46,7 @@ Stats stats() {
 #include <vector>
 
 #include <c10/util/irange.h>
-#include <cxxabi.h>
 #include <torch/csrc/profiler/unwind/communicate.h>
-#include <torch/csrc/profiler/unwind/dwarf_enums.h>
 #include <torch/csrc/profiler/unwind/eh_frame_hdr.h>
 #include <torch/csrc/profiler/unwind/fast_symbolizer.h>
 #include <torch/csrc/profiler/unwind/fde.h>
@@ -64,6 +63,10 @@ struct UpgradeExclusive {
     rdlock_.unlock();
     rdlock_.mutex()->lock();
   }
+  UpgradeExclusive(const UpgradeExclusive&) = delete;
+  UpgradeExclusive(UpgradeExclusive&&) = delete;
+  UpgradeExclusive& operator=(const UpgradeExclusive&) = delete;
+  UpgradeExclusive& operator=(UpgradeExclusive&&) = delete;
   ~UpgradeExclusive() {
     rdlock_.mutex()->unlock();
     rdlock_.lock();
@@ -120,15 +123,17 @@ static const char* process_name() {
 }
 
 struct Version {
-  uint64_t adds_ = LONG_LONG_MAX;
-  uint64_t subs_ = LONG_LONG_MAX;
+  uint64_t adds_ = LLONG_MAX;
+  uint64_t subs_ = LLONG_MAX;
 };
 
 struct UnwindCache {
   Version currentVersion() {
     Version r;
     dl_iterate_phdr(
-        [](struct dl_phdr_info* info, size_t size, void* data) {
+        [](struct dl_phdr_info* info,
+           size_t size [[maybe_unused]],
+           void* data) {
           Version* v = (Version*)data;
           v->adds_ = info->dlpi_adds;
           v->subs_ = info->dlpi_subs;
@@ -142,7 +147,9 @@ struct UnwindCache {
     all_libraries_.clear();
     ip_cache_.clear();
     dl_iterate_phdr(
-        [](struct dl_phdr_info* info, size_t size, void* data) {
+        [](struct dl_phdr_info* info,
+           size_t size [[maybe_unused]],
+           void* data) {
           auto self = (UnwindCache*)data;
           uint64_t last_addr = 0;
           auto segments = (Elf64_Phdr*)info->dlpi_phdr;
@@ -232,7 +239,7 @@ struct UnwindCache {
   const LibraryInfo& libraryFor(uint64_t addr) {
     auto* r = findLibraryFor(addr);
     if (!r) {
-      for (const auto& l : libraries_with_no_unwind_) {
+      for ([[maybe_unused]] const auto& l : libraries_with_no_unwind_) {
         TORCH_WARN("Did not find a PT_GNU_EH_FRAME segment for ", l);
       }
       libraries_with_no_unwind_.clear();
@@ -290,12 +297,12 @@ std::vector<void*> unwind() {
 
 std::optional<std::pair<std::string, uint64_t>> libraryFor(void* addr) {
   if (!addr) {
-    return c10::nullopt;
+    return std::nullopt;
   }
   std::shared_lock lock(cache_mutex_);
   const LibraryInfo* library_info = unwind_cache.findLibraryFor((uint64_t)addr);
   if (!library_info) {
-    return c10::nullopt;
+    return std::nullopt;
   }
   return std::make_pair(
       library_info->name(), (uint64_t)addr - library_info->load_bias());
@@ -312,10 +319,10 @@ static std::string dladdr_lookup(void* addr) {
 
 struct Symbolizer {
   Symbolizer() {
-    auto envar = std::getenv("TORCH_ADDR2LINE_BINARY");
-    if (envar != nullptr) {
+    auto envar = c10::utils::get_env("TORCH_ADDR2LINE_BINARY");
+    if (envar.has_value()) {
       // currently we take user's input as is without checking
-      addr2line_binary_ = envar;
+      addr2line_binary_ = std::move(envar.value());
       TORCH_WARN("Use custom addr2line binary: ", addr2line_binary_);
     } else {
       addr2line_binary_ = "addr2line"; // default
@@ -344,7 +351,7 @@ struct Symbolizer {
     entry.queried.push_back(addr);
     auto libaddress = maybe_library->second - 1;
     // NOLINTNEXTLINE(performance-no-int-to-ptr)
-    entry.comm->out() << (void*)libaddress << "\n";
+    entry.comm->out() << (void*)libaddress << '\n';
     // we need to make sure we don't write more than 64k bytes to
     // a pipe before reading the results. Otherwise the buffer may
     // get filled and block before we read the results.
@@ -370,7 +377,7 @@ struct Symbolizer {
 
  private:
   static constexpr int BLOCK = 1024;
-  const char* addr2line_binary_;
+  std::string addr2line_binary_;
   struct Entry {
     std::unique_ptr<Communicate> comm;
     std::vector<void*> queried;
@@ -385,12 +392,13 @@ struct Symbolizer {
     if (it == entries_.end()) {
       // NOLINTNEXTLINE(*-c-arrays*)
       const char* args[] = {
-          addr2line_binary_, "-C", "-f", "-e", name.c_str(), nullptr};
+          addr2line_binary_.c_str(), "-C", "-f", "-e", name.c_str(), nullptr};
       it = entries_
                .insert_or_assign(
                    name,
                    Entry{
-                       std::make_unique<Communicate>(addr2line_binary_, args),
+                       std::make_unique<Communicate>(
+                           addr2line_binary_.c_str(), args),
                        {}})
                .first;
     }
@@ -493,11 +501,14 @@ Stats stats() {
 
 } // namespace torch::unwind
 
-extern "C" void unwind_c(std::vector<void*>* result, int64_t rsp, int64_t rbp) {
+extern "C" C10_USED void unwind_c(
+    std::vector<void*>* result,
+    int64_t rsp,
+    int64_t rbp) {
   std::shared_lock lock(torch::unwind::cache_mutex_);
   torch::unwind::UnwindState state{};
   // NOLINTNEXTLINE(performance-no-int-to-ptr)
-  state.rip = *(int64_t*)(rsp);
+  state.rip = *(int64_t*)rsp;
   // +8 because we saved rsp after the return address was already pushed
   // to the stack
   state.rsp = rsp + 8;

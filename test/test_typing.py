@@ -8,7 +8,7 @@ import shutil
 import unittest
 from collections import defaultdict
 from threading import Lock
-from typing import Dict, IO, List, Optional
+from typing import IO, Optional
 
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -35,7 +35,7 @@ CACHE_DIR = os.path.join(DATA_DIR, ".mypy_cache")
 
 
 def _key_func(key: str) -> str:
-    """Split at the first occurance of the ``:`` character.
+    """Split at the first occurrence of the ``:`` character.
 
     Windows drive-letters (*e.g.* ``C:``) are ignored herein.
     """
@@ -49,12 +49,12 @@ def _strip_filename(msg: str) -> str:
     return tail.split(":", 1)[-1]
 
 
-def _run_mypy() -> Dict[str, List[str]]:
+def _run_mypy() -> dict[str, list[str]]:
     """Clears the cache and run mypy before running any of the typing tests."""
     if os.path.isdir(CACHE_DIR):
         shutil.rmtree(CACHE_DIR)
 
-    rc: Dict[str, List[str]] = {}
+    rc: dict[str, list[str]] = {}
     for directory in (REVEAL_DIR, PASS_DIR, FAIL_DIR):
         # Run mypy
         stdout, stderr, _ = api.run(
@@ -67,7 +67,8 @@ def _run_mypy() -> Dict[str, List[str]]:
                 directory,
             ]
         )
-        assert not stderr, stderr
+        if stderr:
+            raise AssertionError(stderr)
         stdout = stdout.replace("*", "")
 
         # Parse the output
@@ -119,10 +120,10 @@ def _construct_format_dict():
 
 #: A dictionary with all supported format keys (as keys)
 #: and matching values
-FORMAT_DICT: Dict[str, str] = _construct_format_dict()
+FORMAT_DICT: dict[str, str] = _construct_format_dict()
 
 
-def _parse_reveals(file: IO[str]) -> List[str]:
+def _parse_reveals(file: IO[str]) -> list[str]:
     """Extract and parse all ``"  # E: "`` comments from the passed file-like object.
 
     All format keys will be substituted for their respective value from `FORMAT_DICT`,
@@ -135,7 +136,7 @@ def _parse_reveals(file: IO[str]) -> List[str]:
     comments = "/n".join(comments_array)
 
     # Only search for the `{*}` pattern within comments,
-    # otherwise there is the risk of accidently grabbing dictionaries and sets
+    # otherwise there is the risk of accidentally grabbing dictionaries and sets
     key_set = set(re.findall(r"\{(.*?)\}", comments))
     kwargs = {
         k: FORMAT_DICT.get(k, f"<UNRECOGNIZED FORMAT KEY {k!r}>") for k in key_set
@@ -160,10 +161,10 @@ def _test_reveal(path: str, reveal: str, expected_reveal: str, lineno: int) -> N
 @unittest.skipIf(NO_MYPY, reason="Mypy is not installed")
 class TestTyping(TestCase):
     _lock = Lock()
-    _cached_output: Optional[Dict[str, List[str]]] = None
+    _cached_output: Optional[dict[str, list[str]]] = None
 
     @classmethod
-    def get_mypy_output(cls) -> Dict[str, List[str]]:
+    def get_mypy_output(cls) -> dict[str, list[str]]:
         with cls._lock:
             if cls._cached_output is None:
                 cls._cached_output = _run_mypy()
@@ -187,12 +188,12 @@ class TestTyping(TestCase):
         name_fn=lambda b: os.path.relpath(b, start=FAIL_DIR),
     )
     def test_fail(self, path):
-        __tracebackhide__ = True
+        __tracebackhide__ = True  # noqa: F841
 
         with open(path) as fin:
             lines = fin.readlines()
 
-        errors = defaultdict(lambda: "")
+        errors = defaultdict(str)
 
         output_mypy = self.get_mypy_output()
         self.assertIn(path, output_mypy)
@@ -226,13 +227,14 @@ class TestTyping(TestCase):
         name_fn=lambda b: os.path.relpath(b, start=REVEAL_DIR),
     )
     def test_reveal(self, path):
-        __tracebackhide__ = True
+        __tracebackhide__ = True  # noqa: F841
 
         with open(path) as fin:
             lines = _parse_reveals(fin)
 
         output_mypy = self.get_mypy_output()
-        assert path in output_mypy
+        if path not in output_mypy:
+            raise AssertionError(f"path {path} not in mypy output")
         for error_line in output_mypy[path]:
             match = re.match(
                 r"^.+\.py:(?P<lineno>\d+):(?P<colno>\d+): note: .+$",
@@ -241,7 +243,10 @@ class TestTyping(TestCase):
             if match is None:
                 raise ValueError(f"Unexpected reveal line format: {error_line}")
             lineno = int(match.group("lineno")) - 1
-            assert "Revealed type is" in error_line
+            if "Revealed type is" not in error_line:
+                raise AssertionError(
+                    f"expected 'Revealed type is' in error_line: {error_line}"
+                )
 
             marker = lines[lineno]
             _test_reveal(path, marker, error_line, 1 + lineno)

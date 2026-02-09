@@ -6,16 +6,13 @@
 
 #include <ATen/detail/AcceleratorHooksInterface.h>
 
-// Forward-declares at::Generator and at::cuda::NVRTC
+// NB: Class must live in `at` due to limitations of Registry.h.
 namespace at {
-struct Generator;
+
+// Forward-declares at::cuda::NVRTC
 namespace cuda {
 struct NVRTC;
 } // namespace cuda
-} // namespace at
-
-// NB: Class must live in `at` due to limitations of Registry.h.
-namespace at {
 
 #ifdef _MSC_VER
 constexpr const char* CUDA_HELP =
@@ -65,19 +62,31 @@ struct TORCH_API CUDAHooksInterface : AcceleratorHooksInterface {
   ~CUDAHooksInterface() override = default;
 
   // Initialize THCState and, transitively, the CUDA state
-  virtual void initCUDA() const {
+  void init() const override {
     TORCH_CHECK(false, "Cannot initialize CUDA without ATen_cuda library. ", CUDA_HELP);
   }
 
-  virtual const Generator& getDefaultCUDAGenerator(C10_UNUSED DeviceIndex device_index = -1) const {
-    TORCH_CHECK(false, "Cannot get default CUDA generator without ATen_cuda library. ", CUDA_HELP);
+  const Generator& getDefaultGenerator(
+      [[maybe_unused]] DeviceIndex device_index = -1) const override {
+    TORCH_CHECK(
+        false,
+        "Cannot get default CUDA generator without ATen_cuda library. ",
+        CUDA_HELP);
   }
 
-  virtual Device getDeviceFromPtr(void* /*data*/) const {
+  Generator getNewGenerator(
+      [[maybe_unused]] DeviceIndex device_index = -1) const override {
+    TORCH_CHECK(
+        false,
+        "Cannot get CUDA generator without ATen_cuda library. ",
+        CUDA_HELP);
+  }
+
+  Device getDeviceFromPtr(void* /*data*/) const override {
     TORCH_CHECK(false, "Cannot get device of pointer on CUDA without ATen_cuda library. ", CUDA_HELP);
   }
 
-  virtual bool isPinnedPtr(const void* /*data*/) const {
+  bool isPinnedPtr(const void* /*data*/)  const override {
     return false;
   }
 
@@ -109,6 +118,14 @@ struct TORCH_API CUDAHooksInterface : AcceleratorHooksInterface {
     return false;
   }
 
+  virtual bool hasCKSDPA() const {
+    return false;
+  }
+
+  virtual bool hasCKGEMM() const {
+    return false;
+  }
+
   virtual const at::cuda::NVRTC& nvrtc() const {
     TORCH_CHECK(false, "NVRTC requires CUDA. ", CUDA_HELP);
   }
@@ -121,7 +138,7 @@ struct TORCH_API CUDAHooksInterface : AcceleratorHooksInterface {
     return -1;
   }
 
-  virtual Allocator* getPinnedMemoryAllocator() const {
+  Allocator* getPinnedMemoryAllocator() const override {
     TORCH_CHECK(false, "Pinned memory requires CUDA. ", CUDA_HELP);
   }
 
@@ -149,8 +166,28 @@ struct TORCH_API CUDAHooksInterface : AcceleratorHooksInterface {
     return false;
   }
 
+  virtual bool supportsBFloat16RNNWithCuDNN() const {
+    return false;
+  }
+
   virtual long versionCuDNN() const {
     TORCH_CHECK(false, "Cannot query cuDNN version without ATen_cuda library. ", CUDA_HELP);
+  }
+
+  virtual long versionRuntimeCuDNN() const {
+    TORCH_CHECK(false, "Cannot query cuDNN version without ATen_cuda library. ", CUDA_HELP);
+  }
+
+  virtual long versionCuDNNFrontend() const {
+    TORCH_CHECK(false, "Cannot query cuDNN Frontend version without ATen_cuda library. ", CUDA_HELP);
+  }
+
+  virtual long versionMIOpen() const {
+    TORCH_CHECK(false, "Cannot query MIOpen version without ATen_cuda library. ", CUDA_HELP);
+  }
+
+  virtual long versionHipBLASLt() const {
+    TORCH_CHECK(false, "Cannot query HipBLASLt version without ATen_cuda library. ", CUDA_HELP);
   }
 
   virtual long versionCUDART() const {
@@ -185,6 +222,24 @@ struct TORCH_API CUDAHooksInterface : AcceleratorHooksInterface {
   virtual int getNumGPUs() const {
     return 0;
   }
+
+#ifdef USE_ROCM
+  virtual bool isGPUArch(const std::vector<std::string>& /*archs*/, DeviceIndex = -1 /*device_index*/) const {
+    TORCH_CHECK(false, "Cannot check GPU arch without ATen_cuda library. ", CUDA_HELP);
+  }
+
+  virtual const std::vector<std::string>& getHipblasltPreferredArchs() const {
+    static const std::vector<std::string> empty;
+    TORCH_CHECK(false, "Cannot get hipBLASLt preferred archs without ATen_cuda library. ", CUDA_HELP);
+    return empty;
+  }
+
+  virtual const std::vector<std::string>& getHipblasltSupportedArchs() const {
+    static const std::vector<std::string> empty;
+    TORCH_CHECK(false, "Cannot get hipBLASLt supported archs without ATen_cuda library. ", CUDA_HELP);
+    return empty;
+  }
+#endif
 
   virtual void deviceSynchronize(DeviceIndex /*device_index*/) const {
     TORCH_CHECK(false, "Cannot synchronize CUDA device without ATen_cuda library. ", CUDA_HELP);

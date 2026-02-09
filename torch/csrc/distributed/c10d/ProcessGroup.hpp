@@ -1,6 +1,7 @@
 #pragma once
 
 #include <torch/csrc/distributed/c10d/Backend.hpp>
+#include <torch/csrc/distributed/c10d/Work.hpp>
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -10,7 +11,6 @@
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <c10/macros/Macros.h>
 
-#include <torch/csrc/distributed/c10d/Work.hpp>
 // *************************************************************************
 // PROCESS GROUP collective communication API IS BEING CHANGED BETWEEN
 // versions 1.7 and 1.8.
@@ -22,6 +22,31 @@ constexpr auto kProcessGroupDefaultTimeout =
     std::chrono::milliseconds(30 * 60 * 1000);
 
 namespace c10d {
+
+// We only call `register_work()` in two cases:
+// 1. If the work object is created from a functional collective call.
+// 2. If the work object is created from a non-functional collective call within
+//    the `with allow_inflight_collective_as_graph_input_ctx()` context manager.
+C10_EXPORT void register_work(
+    const at::Tensor& tensor,
+    const c10::intrusive_ptr<c10d::Work>& work);
+
+C10_EXPORT at::Tensor wait_tensor(const at::Tensor& tensor);
+
+// We only call `unregister_work()` in one case:
+// 1. If the work object is created from a non-functional collective call within
+//    the `with allow_inflight_collective_as_graph_input_ctx()` context manager.
+//
+// Q: What about the functional collective case?
+// A: The unregistration of work object for functional collective is done in
+//    the required user-side explicit call to `wait_tensor()`.
+C10_EXPORT void unregister_work(const c10::intrusive_ptr<c10d::Work>& work);
+
+C10_EXPORT size_t get_work_registry_size();
+
+C10_EXPORT void set_allow_inflight_collective_as_graph_input(bool value);
+
+C10_EXPORT bool allow_inflight_collective_as_graph_input();
 
 // ProcessGroup is a base class that captures collective and point to
 // point communication in a fixed set of processes.
@@ -45,22 +70,19 @@ namespace c10d {
 //
 class TORCH_API ProcessGroup : public torch::CustomClassHolder {
  public:
-  // ProcessGroup Options is a base struct that defines the basic options
-  // when constructing a ProcessGroup. Each ProcessGroup subclass should
-  // extend this struct and define its options if it wants to provide more
-  // config options (beyond basic ones defined here) to end user.
-  struct TORCH_API Options : torch::CustomClassHolder {
-    explicit Options(
-        std::string backend,
-        std::chrono::milliseconds timeout = kProcessGroupDefaultTimeout)
-        : timeout(timeout), backend(std::move(backend)) {}
-    ~Options() override = default;
+  struct TORCH_API MergeOptions : torch::CustomClassHolder {
+    explicit MergeOptions(
+        const std::chrono::milliseconds timeout = kProcessGroupDefaultTimeout,
+        const std::optional<std::string> group_name = std::nullopt,
+        const std::optional<std::string> group_desc = std::nullopt)
+        : timeout(timeout), group_name(group_name), group_desc(group_desc) {}
+    ~MergeOptions() override = default;
+    MergeOptions(const MergeOptions&) = delete;
+    MergeOptions& operator=(const MergeOptions&) = delete;
 
     std::chrono::milliseconds timeout;
-
-    // backend name
-    // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
-    const std::string backend;
+    std::optional<std::string> group_name;
+    std::optional<std::string> group_desc;
   };
 
   enum BackendType : uint8_t {
@@ -69,25 +91,64 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
     NCCL = 2,
     UCC = 3,
     MPI = 4,
-    CUSTOM = 5,
+    XCCL = 5,
+    CUSTOM = 6,
   };
+
+  static std::string backendTypeToString(const BackendType& type) {
+    switch (type) {
+      case BackendType::GLOO:
+        return "gloo";
+      case BackendType::NCCL:
+        return "nccl";
+      case BackendType::XCCL:
+        return "xccl";
+      case BackendType::UCC:
+        return "ucc";
+      case BackendType::MPI:
+        return "mpi";
+      case BackendType::UNDEFINED:
+        return "undefined";
+      case BackendType::CUSTOM:
+        return "custom";
+      default:
+        TORCH_CHECK(false, "THis should never happen!");
+    }
+  }
+
+  static BackendType strToBackendType(const std::string& backend) {
+    if (backend == "undefined") {
+      return BackendType::UNDEFINED;
+    } else if (backend == "gloo") {
+      return BackendType::GLOO;
+    } else if (backend == "nccl") {
+      return BackendType::NCCL;
+    } else if (backend == "xccl") {
+      return BackendType::XCCL;
+    } else if (backend == "ucc") {
+      return BackendType::UCC;
+    } else if (backend == "mpi") {
+      return BackendType::MPI;
+    } else {
+      return BackendType::CUSTOM;
+    }
+  }
 
   // Not used, set for backwards compatibility and only used for TypeDef in
   // Ops.cpp
   explicit ProcessGroup(int rank, int size);
 
   explicit ProcessGroup(
-      const c10::intrusive_ptr<::c10d::Store>& store,
+      c10::intrusive_ptr<::c10d::Store> store,
       int rank,
-      int size,
-      c10::intrusive_ptr<Options> options);
+      int size);
   ~ProcessGroup() override;
 
-  int getRank() const {
+  virtual int getRank() const {
     return rank_;
   }
 
-  int getSize() const {
+  virtual int getSize() const {
     return size_;
   }
 
@@ -103,12 +164,29 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
   }
 
   virtual const std::string getBackendName() const {
-    return options_->backend;
-  };
+    return backendTypeToString(backendType_);
+  }
 
   BackendType getBackendType() const {
     return backendType_;
-  };
+  }
+
+  inline bool backendSupportsSequenceNumbers(BackendType backendType) {
+    if (backendType == BackendType::GLOO || backendType == BackendType::NCCL ||
+        backendType == BackendType::XCCL || backendType == BackendType::UCC)
+      return true;
+    return false;
+  }
+
+  virtual void setTimeout(std::chrono::milliseconds timeout) {
+    for (auto& backend : backendTypeToBackend_) {
+      backend.second->setTimeout(timeout);
+    }
+  }
+
+  int64_t incrementSplitCount() {
+    return splitCounter_++;
+  }
 
   virtual void startCoalescing(c10::DeviceType deviceType) {
     // only nccl has implemented startCoalescing so only execute for nccl
@@ -142,13 +220,20 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
     // It's awakward to unbox the opts here and box them again in the custom C++
     // op. But it's also complicated to make opts as a CustomClassHolder. Leave
     // it as it is now.
-    return std::get<1>(op.call(
+    auto work = std::get<1>(op.call(
         tensors,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
         opts.rootRank,
         opts.rootTensor,
         opts.asyncOp,
         opts.timeout.count()));
+
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      for (const auto& tensor : tensors) {
+        c10d::register_work(tensor, work);
+      }
+    }
+    return work;
   }
 
   virtual c10::intrusive_ptr<Work> allreduce(
@@ -163,14 +248,23 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
                     const c10::intrusive_ptr<::c10d::ProcessGroup>&,
                     const c10::intrusive_ptr<::c10d::ReduceOp>&,
                     const std::optional<at::Tensor>& sparse_indices,
+                    bool,
                     int64_t)>();
 
-    return std::get<1>(op.call(
+    auto work = std::get<1>(op.call(
         tensors,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
         c10::make_intrusive<ReduceOp>(opts.reduceOp),
         opts.sparseIndices,
+        opts.asyncOp,
         opts.timeout.count()));
+
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      for (const auto& tensor : tensors) {
+        c10d::register_work(tensor, work);
+      }
+    }
+    return work;
   }
 
   virtual c10::intrusive_ptr<Work> allreduce_coalesced(
@@ -182,13 +276,22 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
                              at::TensorList,
                              const c10::intrusive_ptr<::c10d::ProcessGroup>&,
                              const c10::intrusive_ptr<::c10d::ReduceOp>&,
+                             bool,
                              int64_t)>();
 
-    return op.call(
+    auto work = op.call(
         tensors,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
         c10::make_intrusive<ReduceOp>(opts.reduceOp),
+        opts.asyncOp,
         opts.timeout.count());
+
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      for (const auto& tensor : tensors) {
+        c10d::register_work(tensor, work);
+      }
+    }
+    return work;
   }
 
   virtual c10::intrusive_ptr<Work> reduce(
@@ -202,14 +305,23 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
                              const c10::intrusive_ptr<::c10d::ReduceOp>&,
                              int64_t,
                              int64_t,
+                             bool,
                              int64_t)>();
-    return op.call(
+    auto work = op.call(
         tensors,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
         c10::make_intrusive<ReduceOp>(opts.reduceOp),
         opts.rootRank,
         opts.rootTensor,
+        opts.asyncOp,
         opts.timeout.count());
+
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      for (const auto& tensor : tensors) {
+        c10d::register_work(tensor, work);
+      }
+    }
+    return work;
   }
 
   virtual c10::intrusive_ptr<Work> allgather(
@@ -224,13 +336,24 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
                              const std::vector<std::vector<at::Tensor>>&,
                              at::TensorList,
                              const c10::intrusive_ptr<::c10d::ProcessGroup>&,
+                             bool,
                              int64_t)>();
 
-    return std::get<1>(op.call(
+    auto work = std::get<1>(op.call(
         outputTensors,
         inputTensors,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
+        opts.asyncOp,
         opts.timeout.count()));
+
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      for (const auto& tensor_list : outputTensors) {
+        for (const auto& tensor : tensor_list) {
+          c10d::register_work(tensor, work);
+        }
+      }
+    }
+    return work;
   }
 
   // Gathers a single tensor inputBuffer into a single buffer outputBuffer that
@@ -251,12 +374,17 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
                 bool,
                 int64_t)>();
 
-    return std::get<1>(op.call(
+    auto work = std::get<1>(op.call(
         outputBuffer,
         inputBuffer,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
         opts.asyncOp,
         opts.timeout.count()));
+
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      c10d::register_work(outputBuffer, work);
+    }
+    return work;
   }
 
   // This function is deprecated and will be moved out of ProcessGroup to comms:
@@ -267,18 +395,28 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
       std::vector<std::vector<at::Tensor>>& outputTensorLists,
       std::vector<at::Tensor>& inputTensors,
       const AllgatherOptions& opts = AllgatherOptions()) {
-    static auto op =
-        c10::Dispatcher::singleton()
-            .findSchemaOrThrow("c10d::allgather_coalesced_", "")
-            .typed<c10::intrusive_ptr<Work>(
-                const std::vector<std::vector<at::Tensor>>&,
-                const at::TensorList&,
-                const c10::intrusive_ptr<::c10d::ProcessGroup>&)>();
+    static auto op = c10::Dispatcher::singleton()
+                         .findSchemaOrThrow("c10d::allgather_coalesced_", "")
+                         .typed<c10::intrusive_ptr<Work>(
+                             const std::vector<std::vector<at::Tensor>>&,
+                             const at::TensorList&,
+                             const c10::intrusive_ptr<::c10d::ProcessGroup>&,
+                             bool)>();
 
-    return op.call(
+    auto work = op.call(
         outputTensorLists,
         inputTensors,
-        c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this));
+        c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
+        opts.asyncOp);
+
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      for (const auto& tensor_list : outputTensorLists) {
+        for (const auto& tensor : tensor_list) {
+          c10d::register_work(tensor, work);
+        }
+      }
+    }
+    return work;
   }
 
   // This function is a coalesced version of `allgather_into_tensor` (currently
@@ -294,12 +432,21 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
             .typed<c10::intrusive_ptr<Work>(
                 const at::TensorList,
                 const at::TensorList,
-                const c10::intrusive_ptr<::c10d::ProcessGroup>&)>();
+                const c10::intrusive_ptr<::c10d::ProcessGroup>&,
+                bool)>();
 
-    return op.call(
+    auto work = op.call(
         outputTensors,
         inputTensors,
-        c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this));
+        c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
+        opts.asyncOp);
+
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      for (const auto& tensor : outputTensors) {
+        c10d::register_work(tensor, work);
+      }
+    }
+    return work;
   }
 
   virtual c10::intrusive_ptr<Work> gather(
@@ -313,13 +460,24 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
                              const at::TensorList&,
                              const c10::intrusive_ptr<::c10d::ProcessGroup>&,
                              int64_t,
+                             bool,
                              int64_t)>();
-    return op.call(
+    auto work = op.call(
         outputTensors,
         inputTensors,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
         opts.rootRank,
+        opts.asyncOp,
         opts.timeout.count());
+
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      for (const auto& tensor_list : outputTensors) {
+        for (const auto& tensor : tensor_list) {
+          c10d::register_work(tensor, work);
+        }
+      }
+    }
+    return work;
   }
 
   virtual c10::intrusive_ptr<Work> scatter(
@@ -337,13 +495,20 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
                     int64_t,
                     bool,
                     int64_t)>();
-    return std::get<1>(op.call(
+    auto work = std::get<1>(op.call(
         outputTensors,
         inputTensors,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
         opts.rootRank,
         opts.asyncOp,
         opts.timeout.count()));
+
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      for (const auto& tensor : outputTensors) {
+        c10d::register_work(tensor, work);
+      }
+    }
+    return work;
   }
 
   virtual c10::intrusive_ptr<Work> reduce_scatter(
@@ -359,13 +524,22 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
                     const std::vector<std::vector<at::Tensor>>&,
                     const c10::intrusive_ptr<::c10d::ProcessGroup>&,
                     const c10::intrusive_ptr<::c10d::ReduceOp>&,
+                    bool,
                     int64_t)>();
-    return std::get<1>(op.call(
+    auto work = std::get<1>(op.call(
         outputTensors,
         inputTensors,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
         c10::make_intrusive<::c10d::ReduceOp>(opts.reduceOp),
+        opts.asyncOp,
         opts.timeout.count()));
+
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      for (const auto& tensor : outputTensors) {
+        c10d::register_work(tensor, work);
+      }
+    }
+    return work;
   }
 
   virtual c10::intrusive_ptr<Work> _reduce_scatter_base(
@@ -382,13 +556,18 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
                 const c10::intrusive_ptr<::c10d::ReduceOp>&,
                 bool,
                 int64_t)>();
-    return std::get<1>(op.call(
+    auto work = std::get<1>(op.call(
         outputBuffer,
         inputBuffer,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
         c10::make_intrusive<::c10d::ReduceOp>(opts.reduceOp),
         opts.asyncOp,
         opts.timeout.count()));
+
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      c10d::register_work(outputBuffer, work);
+    }
+    return work;
   }
 
   // This function is a coalesced version of `reduce_scatter_tensor` (currently
@@ -406,14 +585,23 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
                 const at::TensorList,
                 const c10::intrusive_ptr<::c10d::ProcessGroup>&,
                 const c10::intrusive_ptr<::c10d::ReduceOp>&,
+                bool,
                 int64_t)>();
 
-    return op.call(
+    auto work = op.call(
         outputTensors,
         inputTensors,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
         c10::make_intrusive<::c10d::ReduceOp>(opts.reduceOp),
+        opts.asyncOp,
         opts.timeout.count());
+
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      for (const auto& tensor : outputTensors) {
+        c10d::register_work(tensor, work);
+      }
+    }
+    return work;
   }
 
   virtual c10::intrusive_ptr<Work> alltoall_base(
@@ -430,14 +618,21 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
                              const c10::intrusive_ptr<::c10d::ProcessGroup>&,
                              std::vector<int64_t>,
                              std::vector<int64_t>,
+                             bool,
                              int64_t)>();
-    return op.call(
+    auto work = op.call(
         outputBuffer,
         inputBuffer,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
         outputSplitSizes,
         inputSplitSizes,
+        opts.asyncOp,
         opts.timeout.count());
+
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      c10d::register_work(outputBuffer, work);
+    }
+    return work;
   }
 
   virtual c10::intrusive_ptr<Work> alltoall(
@@ -452,12 +647,21 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
                     const at::TensorList&,
                     const at::TensorList&,
                     const c10::intrusive_ptr<::c10d::ProcessGroup>&,
+                    bool,
                     int64_t)>();
-    return std::get<1>(op.call(
+    auto work = std::get<1>(op.call(
         outputTensors,
         inputTensors,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
+        opts.asyncOp,
         opts.timeout.count()));
+
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      for (const auto& tensor : outputTensors) {
+        c10d::register_work(tensor, work);
+      }
+    }
+    return work;
   }
 
   virtual void monitoredBarrier(
@@ -487,9 +691,7 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
   virtual void setSequenceNumberForGroup() {
     auto backendType = getBackendType();
     // TODO: HACK for backend name to get sequence number for that backend.
-    if (backendType == ProcessGroup::BackendType::GLOO ||
-        backendType == ProcessGroup::BackendType::NCCL ||
-        backendType == ProcessGroup::BackendType::UCC) {
+    if (backendSupportsSequenceNumbers(backendType)) {
       getDefaultBackend()->setSequenceNumberForGroup();
     } else {
       TORCH_CHECK(
@@ -508,9 +710,7 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
     auto backendType = getBackendType();
 
     // TODO: HACK for backend name to get sequence number for that backend.
-    if (backendType == ProcessGroup::BackendType::GLOO ||
-        backendType == ProcessGroup::BackendType::NCCL ||
-        backendType == ProcessGroup::BackendType::UCC) {
+    if (backendSupportsSequenceNumbers(backendType)) {
       return getDefaultBackend()->getSequenceNumberForGroup();
     } else {
       TORCH_CHECK(
@@ -533,11 +733,17 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
                              const c10::intrusive_ptr<::c10d::ProcessGroup>&,
                              int64_t,
                              int64_t)>();
-    return op.call(
+    auto work = op.call(
         tensors,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
         dstRank,
         tag);
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      for (const auto& tensor : tensors) {
+        c10d::register_work(tensor, work);
+      }
+    }
+    return work;
   }
 
   virtual c10::intrusive_ptr<Work> recv(
@@ -551,11 +757,17 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
                              const c10::intrusive_ptr<::c10d::ProcessGroup>&,
                              int64_t,
                              int64_t)>();
-    return op.call(
+    auto work = op.call(
         tensors,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
         srcRank,
         tag);
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      for (const auto& tensor : tensors) {
+        c10d::register_work(tensor, work);
+      }
+    }
+    return work;
   }
 
   virtual c10::intrusive_ptr<Work> recvAnysource(
@@ -567,10 +779,16 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
                              at::TensorList,
                              const c10::intrusive_ptr<::c10d::ProcessGroup>&,
                              int64_t)>();
-    return op.call(
+    auto work = op.call(
         tensors,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
         tag);
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      for (const auto& tensor : tensors) {
+        c10d::register_work(tensor, work);
+      }
+    }
+    return work;
   }
 
   virtual c10::intrusive_ptr<Work> barrier(
@@ -587,6 +805,11 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
       tensor = at::empty(
           {1},
           at::TensorOptions().device(at::DeviceType::CUDA).dtype(at::kByte));
+    } else if (backendType_ == c10d::ProcessGroup::BackendType::XCCL) {
+      // set xpu tensor for override cpu dispatch
+      tensor = at::empty(
+          {1},
+          at::TensorOptions().device(at::DeviceType::XPU).dtype(at::kByte));
     } else {
       // Default to using cpu implementation
       tensor = at::empty(
@@ -600,17 +823,19 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
                              at::Tensor,
                              const c10::intrusive_ptr<::c10d::ProcessGroup>&,
                              const std::vector<int64_t>&,
+                             bool,
                              int64_t)>();
 
-    return op.call(
+    auto work = op.call(
         tensor,
         c10::intrusive_ptr<ProcessGroup>::unsafe_reclaim_from_nonowning(this),
         opts.device_ids,
+        opts.asyncOp,
         opts.timeout.count());
-  }
-
-  c10::intrusive_ptr<Options> getOptions() {
-    return options_;
+    if (c10d::allow_inflight_collective_as_graph_input()) {
+      c10d::register_work(tensor, work);
+    }
+    return work;
   }
 
   bool hasBackends() {
@@ -643,14 +868,23 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
   }
 
   c10::intrusive_ptr<Backend> getDefaultBackend() const {
+    auto backend_iter = backendTypeToBackend_.find(backendType_);
     TORCH_CHECK(
-        backendTypeToBackend_.find(backendType_) != backendTypeToBackend_.end(),
+        backend_iter != backendTypeToBackend_.end(),
         "Could not find the default backend type ",
-        backendType_,
+        uint16_t(backendType_),
         " for Process Group with name ",
         getBackendName(),
         ".");
-    return backendTypeToBackend_.at(backendType_);
+    return backend_iter->second;
+  }
+
+  void setDefaultBackend(const BackendType& backendType) {
+    backendType_ = backendType;
+  }
+
+  void setDefaultBackend(const std::string& backend) {
+    backendType_ = strToBackendType(backend);
   }
 
   c10::intrusive_ptr<Backend> getBackend(c10::DeviceType deviceType);
@@ -659,7 +893,9 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
     TORCH_CHECK(
         backendTypeToBackend_.find(backendType) != backendTypeToBackend_.end(),
         "Could not find backend type ",
-        backendType,
+        uint16_t(backendType),
+        " for Process Group with name ",
+        backendTypeToString(backendType),
         ".");
     return backendTypeToBackend_.at(backendType);
   }
@@ -686,14 +922,37 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
     getDefaultBackend()->waitForPendingWorks();
   }
 
-  bool hasHooks() const {
-    return getDefaultBackend()->hasHooks();
+  virtual void shutdown() {
+    for (auto& backend : backendTypeToBackend_) {
+      backend.second->shutdown();
+    }
   }
 
-  const std::string& getGroupName() const;
-  void setGroupName(const std::string& name);
-  const std::string& getGroupDesc() const;
-  void setGroupDesc(const std::string& name);
+  virtual void abort() {
+    for (auto& backend : backendTypeToBackend_) {
+      backend.second->abort();
+    }
+  }
+
+  bool hasHooks() const {
+    auto backend_iter = backendTypeToBackend_.find(backendType_);
+    if (backend_iter == backendTypeToBackend_.end()) {
+      TORCH_WARN(
+          "No backend of type ",
+          uint16_t(backendType_),
+          " found for Process Group with name ",
+          getBackendName(),
+          ". Assuming no hooks are registered.");
+      return false;
+    }
+
+    return backend_iter->second->hasHooks();
+  }
+
+  virtual const std::string& getGroupName() const;
+  virtual void setGroupName(const std::string& name);
+  virtual const std::string& getGroupDesc() const;
+  virtual void setGroupDesc(const std::string& name);
   void enableCollectivesTiming();
 
   void release_resources() override;
@@ -707,12 +966,32 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
     return bound_device_id_;
   }
 
+  c10::intrusive_ptr<c10d::Store> getStore() const {
+    return store_;
+  }
+
   void setBoundDeviceId(std::optional<at::Device> device) {
     if (device) {
       TORCH_CHECK(device->has_index(), "setBoundDeviceId must have an index");
     }
     bound_device_id_ = device;
   }
+
+  // This creates a new subgroup using the specified ranks.
+  // The current rank must be included in the list of new_ranks.
+  virtual c10::intrusive_ptr<ProcessGroup> splitGroup(
+      const std::vector<int>& ranks,
+      const std::optional<std::chrono::milliseconds>& timeout,
+      const std::optional<c10::intrusive_ptr<Backend::Options>>& opts,
+      const std::optional<std::string>& name,
+      const std::optional<std::string>& groupDesc);
+
+  // This creates a new subgroup using the specified ranks.
+  // The current rank must be included in the list of new_ranks.
+  virtual c10::intrusive_ptr<ProcessGroup> mergeRemoteGroup(
+      const c10::intrusive_ptr<Store>& store,
+      const MergeOptions& opts,
+      const int& size);
 
  protected:
   // Implementations of this interface need to call this to setup
@@ -725,10 +1004,9 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const int size_;
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
-  const c10::intrusive_ptr<Options> options_;
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
-  const BackendType backendType_;
+  BackendType backendType_;
   std::string pg_desc_;
+  int64_t splitCounter_;
 
   // Debug level setting. It is parsed once when ProcessGroup is constructed and
   // remains the same across use of this process group.
@@ -736,7 +1014,9 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
 
   // Backend classes for this ProcessGroup
   std::unordered_set<c10::DeviceType> deviceTypes_;
-  std::unordered_map<c10::DeviceType, BackendType> deviceTypeToBackendType_;
+  // This mapping is ordered, as splitGroup must call split on the underlying
+  // backends in a consistent order.
+  std::map<c10::DeviceType, BackendType> deviceTypeToBackendType_;
   std::unordered_map<c10::DeviceType, c10::intrusive_ptr<Backend>>
       deviceTypeToBackend_;
   std::unordered_map<BackendType, c10::intrusive_ptr<Backend>>
@@ -744,5 +1024,9 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
 
   std::optional<at::Device> bound_device_id_;
 };
+
+// Thread local functions for managing the currently active process group.
+TORCH_API c10::intrusive_ptr<ProcessGroup>& currentProcessGroup();
+TORCH_API void setProcessGroup(c10::intrusive_ptr<ProcessGroup> processGroup);
 
 } // namespace c10d

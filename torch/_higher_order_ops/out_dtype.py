@@ -44,12 +44,8 @@ class OutDtypeOperator(HigherOrderOperator):
         3. Cast the output to `out_dtype`
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__("out_dtype")
-        # TODO(ydwu4): Subclassing HigherOrderOperator causes __module__ to
-        # become different (torch._higher_order_ops.out_dtype) which will result
-        # in torch.fx to record the op incorrectly in the graph.
-        self.__module__ = "torch.ops.higher_order"
 
     def __call__(self, op, output_dtype, *args):
         if not isinstance(op, torch._ops.OpOverload):
@@ -72,6 +68,7 @@ class OutDtypeOperator(HigherOrderOperator):
                 f"out_dtype only allows the following operators: {ALLOWABLE_OPS}."
             )
 
+        # pyrefly: ignore [missing-attribute]
         res = super().__call__(op, output_dtype, *args)
 
         return res
@@ -110,13 +107,13 @@ def out_dtype_dense(op: torch._ops.OpOverload, output_dtype: torch.dtype, *args)
 
 def is_int_mm(op, output_dtype, args):
     return (
-        op == torch.ops.aten.mm.default
+        op is torch.ops.aten.mm.default
         and output_dtype == torch.int32
         and len(args) == 2
         and args[0].dtype == torch.int8
         and args[1].dtype == torch.int8
-        and args[0].is_cuda
-        and args[1].is_cuda
+        and (args[0].is_cuda or args[0].is_xpu)
+        and (args[1].is_cuda or args[1].is_xpu)
     )
 
 
@@ -134,9 +131,7 @@ def out_dtype_fallback(op, output_dtype, *args):
     return res
 
 
-out_dtype.py_impl(DispatchKey.Autograd)(
-    autograd_not_implemented(out_dtype, deferred_error=True)
-)
+out_dtype.py_autograd_impl(autograd_not_implemented(out_dtype, deferred_error=True))
 
 
 @out_dtype.py_impl(ProxyTorchDispatchMode)
@@ -146,10 +141,7 @@ def out_dtype_proxy(
     output_dtype: torch.dtype,
     *args,
 ):
-    if mode.enable_tracing:
-        return trace_out_dtype(mode, out_dtype, op, output_dtype, *args)
-    else:
-        return out_dtype(op, output_dtype, *args)
+    return trace_out_dtype(mode, out_dtype, op, output_dtype, *args)
 
 
 @out_dtype.py_impl(FakeTensorMode)

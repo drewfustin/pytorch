@@ -2,7 +2,6 @@
 
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
-#include <torch/csrc/jit/passes/tensorexpr_fuser.h>
 #include <torch/csrc/jit/runtime/symbolic_shape_registry_util.h>
 #include <torch/csrc/jit/tensorexpr/kernel.h>
 
@@ -12,7 +11,7 @@ namespace torch::jit::tensorexpr {
 static Node* moveCatAfterUse(
     Node* cat,
     Node* user,
-    std::shared_ptr<Graph> subgraph) {
+    const std::shared_ptr<Graph>& subgraph) {
   // Example IR:
   //   %1 = ...
   //   %2 = ...
@@ -140,7 +139,7 @@ static bool doesCatPromoteTypes(Node* node) {
 //      - When the cat op promote types, the type of inputs to cat after moving
 //        it user needs to reflect the original type. This is currently not
 //        handled. TODO
-static void moveCatOpToEnd(Node* cat, std::shared_ptr<Graph> subgraph) {
+static void moveCatOpToEnd(Node* cat, const std::shared_ptr<Graph>& subgraph) {
   TORCH_INTERNAL_ASSERT(
       cat->kind() == aten::cat,
       buildErrorMessage("Graph node is not aten::cat."));
@@ -162,7 +161,7 @@ static void moveCatOpToEnd(Node* cat, std::shared_ptr<Graph> subgraph) {
 
 // Moves the users of `aten::cat` ops to its inputs whenever possible
 // in the given subgraph.
-static void moveCatOpsToEnd(std::shared_ptr<Graph> subgraph) {
+static void moveCatOpsToEnd(const std::shared_ptr<Graph>& subgraph) {
   std::vector<Node*> cat_nodes;
   for (Node* n : subgraph->nodes()) {
     if (n->kind() == aten::cat) {
@@ -351,7 +350,7 @@ static std::optional<at::ScalarType> inferScalarType(Node* n) {
       if (tt->scalarType() && *tt->scalarType() != scalar_type) {
         GRAPH_DEBUG(
             "Inputs of ", n, " have different scalar types, cannot fixup!");
-        return c10::nullopt;
+        return std::nullopt;
       }
     }
   }
@@ -369,7 +368,7 @@ static std::optional<at::Device> inferDevice(Node* n) {
       }
       if (tt->device() && *tt->device() != device) {
         GRAPH_DEBUG("Inputs of ", n, " have different devices, cannot fixup!");
-        return c10::nullopt;
+        return std::nullopt;
       }
     }
   }
@@ -389,7 +388,7 @@ void fixupMissingShapeInfo(const std::shared_ptr<Graph>& graph) {
         return;
       }
       fixupTypeInfoForValue(
-          input, *tt->scalarType(), tt->device() ? *tt->device() : at::kCPU);
+          input, tt->scalarType(), tt->device() ? tt->device() : at::kCPU);
     }
   }
 

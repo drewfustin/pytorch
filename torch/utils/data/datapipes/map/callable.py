@@ -1,12 +1,16 @@
 # mypy: allow-untyped-defs
-from torch.utils.data.datapipes.utils.common import _check_unpickable_fn
-from typing import Callable, TypeVar
+from collections.abc import Callable
+from typing import TypeVar
+
 from torch.utils.data.datapipes._decorator import functional_datapipe
 from torch.utils.data.datapipes.datapipe import MapDataPipe
+from torch.utils.data.datapipes.utils.common import _check_unpickable_fn
+
 
 __all__ = ["MapperMapDataPipe", "default_fn"]
 
-T_co = TypeVar('T_co', covariant=True)
+
+_T_co = TypeVar("_T_co", covariant=True)
 
 
 # Default function to return each item directly
@@ -16,8 +20,8 @@ def default_fn(data):
     return data
 
 
-@functional_datapipe('map')
-class MapperMapDataPipe(MapDataPipe[T_co]):
+@functional_datapipe("map")
+class MapperMapDataPipe(MapDataPipe[_T_co]):
     r"""
     Apply the input function over each item from the source DataPipe (functional name: ``map``).
 
@@ -56,7 +60,8 @@ class MapperMapDataPipe(MapDataPipe[T_co]):
         self.fn = fn  # type: ignore[assignment]
 
     def __len__(self) -> int:
+        # pyrefly: ignore [bad-argument-type]
         return len(self.datapipe)
 
-    def __getitem__(self, index) -> T_co:
+    def __getitem__(self, index) -> _T_co:
         return self.fn(self.datapipe[index])

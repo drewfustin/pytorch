@@ -1,6 +1,6 @@
 # mypy: allow-untyped-defs
 import math
-from typing import List, Optional, Tuple, Union
+from typing import Literal, Optional
 from typing_extensions import deprecated
 
 import torch
@@ -66,36 +66,37 @@ class _ConvNd(Module):
     ]
     __annotations__ = {"bias": Optional[torch.Tensor]}
 
-    def _conv_forward(self, input: Tensor, weight: Tensor, bias: Optional[Tensor]) -> Tensor:  # type: ignore[empty-body]
-        ...
+    def _conv_forward(  # type: ignore[empty-body]
+        self, input: Tensor, weight: Tensor, bias: Tensor | None
+    ) -> Tensor: ...
 
     in_channels: int
-    _reversed_padding_repeated_twice: List[int]
+    _reversed_padding_repeated_twice: list[int]
     out_channels: int
-    kernel_size: Tuple[int, ...]
-    stride: Tuple[int, ...]
-    padding: Union[str, Tuple[int, ...]]
-    dilation: Tuple[int, ...]
+    kernel_size: tuple[int, ...]
+    stride: tuple[int, ...]
+    padding: str | tuple[int, ...]
+    dilation: tuple[int, ...]
     transposed: bool
-    output_padding: Tuple[int, ...]
+    output_padding: tuple[int, ...]
     groups: int
-    padding_mode: str
+    padding_mode: Literal["zeros", "reflect", "replicate", "circular"]
     weight: Tensor
-    bias: Optional[Tensor]
+    bias: Tensor | None
 
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: Tuple[int, ...],
-        stride: Tuple[int, ...],
-        padding: Tuple[int, ...],
-        dilation: Tuple[int, ...],
+        kernel_size: tuple[int, ...],
+        stride: tuple[int, ...],
+        padding: str | tuple[int, ...],
+        dilation: tuple[int, ...],
         transposed: bool,
-        output_padding: Tuple[int, ...],
+        output_padding: tuple[int, ...],
         groups: int,
         bias: bool,
-        padding_mode: str,
+        padding_mode: Literal["zeros", "reflect", "replicate", "circular"],
         device=None,
         dtype=None,
     ) -> None:
@@ -141,7 +142,10 @@ class _ConvNd(Module):
             self._reversed_padding_repeated_twice = [0, 0] * len(kernel_size)
             if padding == "same":
                 for d, k, i in zip(
-                    dilation, kernel_size, range(len(kernel_size) - 1, -1, -1)
+                    dilation,
+                    kernel_size,
+                    range(len(kernel_size) - 1, -1, -1),
+                    strict=False,
                 ):
                     total_padding = d * (k - 1)
                     left_pad = total_padding // 2
@@ -187,10 +191,7 @@ class _ConvNd(Module):
                 init.uniform_(self.bias, -bound, bound)
 
     def extra_repr(self):
-        s = (
-            "{in_channels}, {out_channels}, kernel_size={kernel_size}"
-            ", stride={stride}"
-        )
+        s = "{in_channels}, {out_channels}, kernel_size={kernel_size}, stride={stride}"
         if self.padding != (0,) * len(self.padding):
             s += ", padding={padding}"
         if self.dilation != (1,) * len(self.dilation):
@@ -241,11 +242,13 @@ class Conv1d(_ConvNd):
     * :attr:`padding` controls the amount of padding applied to the input. It
       can be either a string {{'valid', 'same'}} or a tuple of ints giving the
       amount of implicit padding applied on both sides.
-
+"""
+        """
     * :attr:`dilation` controls the spacing between the kernel points; also
-      known as the \uue0 trous algorithm. It is harder to describe, but this `link`_
+      known as the \u00e0 trous algorithm. It is harder to describe, but this `link`_
       has a nice visualization of what :attr:`dilation` does.
-
+"""
+        r"""
     {groups_note}
 
     Note:
@@ -268,18 +271,16 @@ class Conv1d(_ConvNd):
         stride (int or tuple, optional): Stride of the convolution. Default: 1
         padding (int, tuple or str, optional): Padding added to both sides of
             the input. Default: 0
-        padding_mode (str, optional): ``'zeros'``, ``'reflect'``,
-            ``'replicate'`` or ``'circular'``. Default: ``'zeros'``
         dilation (int or tuple, optional): Spacing between kernel
             elements. Default: 1
         groups (int, optional): Number of blocked connections from input
             channels to output channels. Default: 1
         bias (bool, optional): If ``True``, adds a learnable bias to the
             output. Default: ``True``
+        padding_mode (str, optional): ``'zeros'``, ``'reflect'``,
+            ``'replicate'`` or ``'circular'``. Default: ``'zeros'``
 
-    """.format(
-            **reproducibility_notes, **convolution_notes
-        )
+    """.format(**reproducibility_notes, **convolution_notes)
         + r"""
 
     Shape:
@@ -322,11 +323,11 @@ class Conv1d(_ConvNd):
         out_channels: int,
         kernel_size: _size_1_t,
         stride: _size_1_t = 1,
-        padding: Union[str, _size_1_t] = 0,
+        padding: str | _size_1_t = 0,
         dilation: _size_1_t = 1,
         groups: int = 1,
         bias: bool = True,
-        padding_mode: str = "zeros",  # TODO: refine this type
+        padding_mode: Literal["zeros", "reflect", "replicate", "circular"] = "zeros",
         device=None,
         dtype=None,
     ) -> None:
@@ -352,7 +353,7 @@ class Conv1d(_ConvNd):
             **factory_kwargs,
         )
 
-    def _conv_forward(self, input: Tensor, weight: Tensor, bias: Optional[Tensor]):
+    def _conv_forward(self, input: Tensor, weight: Tensor, bias: Tensor | None):
         if self.padding_mode != "zeros":
             return F.conv1d(
                 F.pad(
@@ -365,6 +366,7 @@ class Conv1d(_ConvNd):
                 self.dilation,
                 self.groups,
             )
+
         return F.conv1d(
             input, weight, bias, self.stride, self.padding, self.dilation, self.groups
         )
@@ -404,10 +406,13 @@ class Conv2d(_ConvNd):
     * :attr:`padding` controls the amount of padding applied to the input. It
       can be either a string {{'valid', 'same'}} or an int / a tuple of ints giving the
       amount of implicit padding applied on both sides.
-
+"""
+        """
     * :attr:`dilation` controls the spacing between the kernel points; also
       known as the \u00e0 trous algorithm. It is harder to describe, but this `link`_
       has a nice visualization of what :attr:`dilation` does.
+"""
+        r"""
 
     {groups_note}
 
@@ -438,16 +443,14 @@ class Conv2d(_ConvNd):
         stride (int or tuple, optional): Stride of the convolution. Default: 1
         padding (int, tuple or str, optional): Padding added to all four sides of
             the input. Default: 0
-        padding_mode (str, optional): ``'zeros'``, ``'reflect'``,
-            ``'replicate'`` or ``'circular'``. Default: ``'zeros'``
         dilation (int or tuple, optional): Spacing between kernel elements. Default: 1
         groups (int, optional): Number of blocked connections from input
             channels to output channels. Default: 1
         bias (bool, optional): If ``True``, adds a learnable bias to the
             output. Default: ``True``
-    """.format(
-            **reproducibility_notes, **convolution_notes
-        )
+        padding_mode (str, optional): ``'zeros'``, ``'reflect'``,
+            ``'replicate'`` or ``'circular'``. Default: ``'zeros'``
+    """.format(**reproducibility_notes, **convolution_notes)
         + r"""
 
     Shape:
@@ -500,11 +503,11 @@ class Conv2d(_ConvNd):
         out_channels: int,
         kernel_size: _size_2_t,
         stride: _size_2_t = 1,
-        padding: Union[str, _size_2_t] = 0,
+        padding: str | _size_2_t = 0,
         dilation: _size_2_t = 1,
         groups: int = 1,
         bias: bool = True,
-        padding_mode: str = "zeros",  # TODO: refine this type
+        padding_mode: Literal["zeros", "reflect", "replicate", "circular"] = "zeros",
         device=None,
         dtype=None,
     ) -> None:
@@ -528,7 +531,7 @@ class Conv2d(_ConvNd):
             **factory_kwargs,
         )
 
-    def _conv_forward(self, input: Tensor, weight: Tensor, bias: Optional[Tensor]):
+    def _conv_forward(self, input: Tensor, weight: Tensor, bias: Tensor | None):
         if self.padding_mode != "zeros":
             return F.conv2d(
                 F.pad(
@@ -541,6 +544,7 @@ class Conv2d(_ConvNd):
                 self.dilation,
                 self.groups,
             )
+
         return F.conv2d(
             input, weight, bias, self.stride, self.padding, self.dilation, self.groups
         )
@@ -574,9 +578,12 @@ class Conv3d(_ConvNd):
     * :attr:`padding` controls the amount of padding applied to the input. It
       can be either a string {{'valid', 'same'}} or a tuple of ints giving the
       amount of implicit padding applied on both sides.
-
+"""
+        """
     * :attr:`dilation` controls the spacing between the kernel points; also known as the \u00e0 trous algorithm.
       It is harder to describe, but this `link`_ has a nice visualization of what :attr:`dilation` does.
+"""
+        r"""
 
     {groups_note}
 
@@ -607,13 +614,11 @@ class Conv3d(_ConvNd):
         stride (int or tuple, optional): Stride of the convolution. Default: 1
         padding (int, tuple or str, optional): Padding added to all six sides of
             the input. Default: 0
-        padding_mode (str, optional): ``'zeros'``, ``'reflect'``, ``'replicate'`` or ``'circular'``. Default: ``'zeros'``
         dilation (int or tuple, optional): Spacing between kernel elements. Default: 1
         groups (int, optional): Number of blocked connections from input channels to output channels. Default: 1
         bias (bool, optional): If ``True``, adds a learnable bias to the output. Default: ``True``
-    """.format(
-            **reproducibility_notes, **convolution_notes
-        )
+        padding_mode (str, optional): ``'zeros'``, ``'reflect'``, ``'replicate'`` or ``'circular'``. Default: ``'zeros'``
+    """.format(**reproducibility_notes, **convolution_notes)
         + r"""
 
     Shape:
@@ -668,11 +673,11 @@ class Conv3d(_ConvNd):
         out_channels: int,
         kernel_size: _size_3_t,
         stride: _size_3_t = 1,
-        padding: Union[str, _size_3_t] = 0,
+        padding: str | _size_3_t = 0,
         dilation: _size_3_t = 1,
         groups: int = 1,
         bias: bool = True,
-        padding_mode: str = "zeros",
+        padding_mode: Literal["zeros", "reflect", "replicate", "circular"] = "zeros",
         device=None,
         dtype=None,
     ) -> None:
@@ -696,7 +701,7 @@ class Conv3d(_ConvNd):
             **factory_kwargs,
         )
 
-    def _conv_forward(self, input: Tensor, weight: Tensor, bias: Optional[Tensor]):
+    def _conv_forward(self, input: Tensor, weight: Tensor, bias: Tensor | None):
         if self.padding_mode != "zeros":
             return F.conv3d(
                 F.pad(
@@ -709,6 +714,7 @@ class Conv3d(_ConvNd):
                 self.dilation,
                 self.groups,
             )
+
         return F.conv3d(
             input, weight, bias, self.stride, self.padding, self.dilation, self.groups
         )
@@ -760,13 +766,13 @@ class _ConvTransposeNd(_ConvNd):
     def _output_padding(
         self,
         input: Tensor,
-        output_size: Optional[List[int]],
-        stride: List[int],
-        padding: List[int],
-        kernel_size: List[int],
+        output_size: list[int] | None,
+        stride: list[int],
+        padding: list[int],
+        kernel_size: list[int],
         num_spatial_dims: int,
-        dilation: Optional[List[int]] = None,
-    ) -> List[int]:
+        dilation: list[int] | None = None,
+    ) -> list[int]:
         if output_size is None:
             ret = _single(self.output_padding)  # converting to list if was not already
         else:
@@ -780,8 +786,8 @@ class _ConvTransposeNd(_ConvNd):
                     f"or {num_non_spatial_dims + num_spatial_dims} elements (got {len(output_size)})"
                 )
 
-            min_sizes = torch.jit.annotate(List[int], [])
-            max_sizes = torch.jit.annotate(List[int], [])
+            min_sizes = torch.jit.annotate(list[int], [])
+            max_sizes = torch.jit.annotate(list[int], [])
             for d in range(num_spatial_dims):
                 dim_size = (
                     (input.size(d + num_non_spatial_dims) - 1) * stride[d]
@@ -803,7 +809,7 @@ class _ConvTransposeNd(_ConvNd):
                         f"from {min_sizes} to {max_sizes} (for an input of {input.size()[2:]})"
                     )
 
-            res = torch.jit.annotate(List[int], [])
+            res = torch.jit.annotate(list[int], [])
             for d in range(num_spatial_dims):
                 res.append(output_size[d] - min_sizes[d])
 
@@ -834,10 +840,12 @@ class ConvTranspose1d(_ConvTransposeNd):
 
     * :attr:`output_padding` controls the additional size added to one side
       of the output shape. See note below for details.
-
+"""
+        """
     * :attr:`dilation` controls the spacing between the kernel points; also known as the \u00e0 trous algorithm.
       It is harder to describe, but the link `here`_ has a nice visualization of what :attr:`dilation` does.
-
+"""
+        r"""
     {groups_note}
 
     Note:
@@ -873,9 +881,7 @@ class ConvTranspose1d(_ConvTransposeNd):
         groups (int, optional): Number of blocked connections from input channels to output channels. Default: 1
         bias (bool, optional): If ``True``, adds a learnable bias to the output. Default: ``True``
         dilation (int or tuple, optional): Spacing between kernel elements. Default: 1
-    """.format(
-            **reproducibility_notes, **convolution_notes
-        )
+    """.format(**reproducibility_notes, **convolution_notes)
         + r"""
 
     Shape:
@@ -898,6 +904,23 @@ class ConvTranspose1d(_ConvTransposeNd):
                          sampled from :math:`\mathcal{U}(-\sqrt{k}, \sqrt{k})` where
                          :math:`k = \frac{groups}{C_\text{out} * \text{kernel\_size}}`
 
+    Examples::
+
+        >>> # With square kernels and equal stride
+        >>> m = nn.ConvTranspose1d(16, 33, 3, stride=2)
+        >>> input = torch.randn(20, 16, 50)
+        >>> output = m(input)
+        >>> # exact output size can be also specified as an argument
+        >>> input = torch.randn(1, 16, 12)
+        >>> downsample = nn.Conv1d(16, 16, 3, stride=2, padding=1)
+        >>> upsample = nn.ConvTranspose1d(16, 16, 3, stride=2, padding=1)
+        >>> h = downsample(input)
+        >>> h.size()
+        torch.Size([1, 16, 6])
+        >>> output = upsample(h, output_size=input.size())
+        >>> output.size()
+        torch.Size([1, 16, 12])
+
     .. _`here`:
         https://github.com/vdumoulin/conv_arithmetic/blob/master/README.md
 
@@ -917,7 +940,7 @@ class ConvTranspose1d(_ConvTransposeNd):
         groups: int = 1,
         bias: bool = True,
         dilation: _size_1_t = 1,
-        padding_mode: str = "zeros",
+        padding_mode: Literal["zeros", "reflect", "replicate", "circular"] = "zeros",
         device=None,
         dtype=None,
     ) -> None:
@@ -942,13 +965,14 @@ class ConvTranspose1d(_ConvTransposeNd):
             **factory_kwargs,
         )
 
-    def forward(self, input: Tensor, output_size: Optional[List[int]] = None) -> Tensor:
+    def forward(self, input: Tensor, output_size: list[int] | None = None) -> Tensor:
         if self.padding_mode != "zeros":
             raise ValueError(
                 "Only `zeros` padding mode is supported for ConvTranspose1d"
             )
 
-        assert isinstance(self.padding, tuple)
+        if not isinstance(self.padding, tuple):
+            raise AssertionError("self.padding must be a tuple")
         # One cannot replace List by Tuple or Sequence in "_output_padding" because
         # TorchScript does not support `Sequence[T]` or `Tuple[T, ...]`.
         num_spatial_dims = 1
@@ -988,7 +1012,10 @@ class ConvTranspose2d(_ConvTransposeNd):
 
     On certain ROCm devices, when using float16 inputs this module will use :ref:`different precision<fp16_on_mi200>` for backward.
 
-    * :attr:`stride` controls the stride for the cross-correlation.
+    * :attr:`stride` controls the stride for the cross-correlation. When stride > 1, ConvTranspose2d inserts zeros between input
+      elements along the spatial dimensions before applying the convolution kernel. This zero-insertion operation is the standard
+      behavior of transposed convolutions, which can increase the spatial resolution and is equivalent to a learnable
+      upsampling operation.
 
     * :attr:`padding` controls the amount of implicit zero padding on both
       sides for ``dilation * (kernel_size - 1) - padding`` number of points. See note
@@ -996,10 +1023,12 @@ class ConvTranspose2d(_ConvTransposeNd):
 
     * :attr:`output_padding` controls the additional size added to one side
       of the output shape. See note below for details.
-
+"""
+        """
     * :attr:`dilation` controls the spacing between the kernel points; also known as the \u00e0 trous algorithm.
       It is harder to describe, but the link `here`_ has a nice visualization of what :attr:`dilation` does.
-
+"""
+        r"""
     {groups_note}
 
     The parameters :attr:`kernel_size`, :attr:`stride`, :attr:`padding`, :attr:`output_padding`
@@ -1036,9 +1065,7 @@ class ConvTranspose2d(_ConvTransposeNd):
         groups (int, optional): Number of blocked connections from input channels to output channels. Default: 1
         bias (bool, optional): If ``True``, adds a learnable bias to the output. Default: ``True``
         dilation (int or tuple, optional): Spacing between kernel elements. Default: 1
-    """.format(
-            **reproducibility_notes, **convolution_notes
-        )
+    """.format(**reproducibility_notes, **convolution_notes)
         + r"""
 
     Shape:
@@ -1102,7 +1129,7 @@ class ConvTranspose2d(_ConvTransposeNd):
         groups: int = 1,
         bias: bool = True,
         dilation: _size_2_t = 1,
-        padding_mode: str = "zeros",
+        padding_mode: Literal["zeros", "reflect", "replicate", "circular"] = "zeros",
         device=None,
         dtype=None,
     ) -> None:
@@ -1127,13 +1154,22 @@ class ConvTranspose2d(_ConvTransposeNd):
             **factory_kwargs,
         )
 
-    def forward(self, input: Tensor, output_size: Optional[List[int]] = None) -> Tensor:
+    def forward(self, input: Tensor, output_size: list[int] | None = None) -> Tensor:
+        """
+        Performs the forward pass.
+
+        Attributes:
+            input (Tensor): The input tensor.
+            output_size (list[int], optional): A list of integers representing
+                the size of the output tensor. Default is None.
+        """
         if self.padding_mode != "zeros":
             raise ValueError(
                 "Only `zeros` padding mode is supported for ConvTranspose2d"
             )
 
-        assert isinstance(self.padding, tuple)
+        if not isinstance(self.padding, tuple):
+            raise AssertionError("self.padding must be a tuple")
         # One cannot replace List by Tuple or Sequence in "_output_padding" because
         # TorchScript does not support `Sequence[T]` or `Tuple[T, ...]`.
         num_spatial_dims = 2
@@ -1184,10 +1220,12 @@ class ConvTranspose3d(_ConvTransposeNd):
 
     * :attr:`output_padding` controls the additional size added to one side
       of the output shape. See note below for details.
-
+"""
+        """
     * :attr:`dilation` controls the spacing between the kernel points; also known as the \u00e0 trous algorithm.
       It is harder to describe, but the link `here`_ has a nice visualization of what :attr:`dilation` does.
-
+"""
+        r"""
     {groups_note}
 
     The parameters :attr:`kernel_size`, :attr:`stride`, :attr:`padding`, :attr:`output_padding`
@@ -1224,9 +1262,7 @@ class ConvTranspose3d(_ConvTransposeNd):
         groups (int, optional): Number of blocked connections from input channels to output channels. Default: 1
         bias (bool, optional): If ``True``, adds a learnable bias to the output. Default: ``True``
         dilation (int or tuple, optional): Spacing between kernel elements. Default: 1
-    """.format(
-            **reproducibility_notes, **convolution_notes
-        )
+    """.format(**reproducibility_notes, **convolution_notes)
         + r"""
 
     Shape:
@@ -1285,7 +1321,7 @@ class ConvTranspose3d(_ConvTransposeNd):
         groups: int = 1,
         bias: bool = True,
         dilation: _size_3_t = 1,
-        padding_mode: str = "zeros",
+        padding_mode: Literal["zeros", "reflect", "replicate", "circular"] = "zeros",
         device=None,
         dtype=None,
     ) -> None:
@@ -1310,13 +1346,14 @@ class ConvTranspose3d(_ConvTransposeNd):
             **factory_kwargs,
         )
 
-    def forward(self, input: Tensor, output_size: Optional[List[int]] = None) -> Tensor:
+    def forward(self, input: Tensor, output_size: list[int] | None = None) -> Tensor:
         if self.padding_mode != "zeros":
             raise ValueError(
                 "Only `zeros` padding mode is supported for ConvTranspose3d"
             )
 
-        assert isinstance(self.padding, tuple)
+        if not isinstance(self.padding, tuple):
+            raise AssertionError("self.padding must be a tuple")
         # One cannot replace List by Tuple or Sequence in "_output_padding" because
         # TorchScript does not support `Sequence[T]` or `Tuple[T, ...]`.
         num_spatial_dims = 3
@@ -1363,7 +1400,7 @@ class _ConvTransposeMixin(_ConvTransposeNd):
         "Please consider using public APIs.",
         category=FutureWarning,
     )
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
 
@@ -1377,7 +1414,7 @@ class _LazyConvXdMixin(LazyModuleMixin):
     transposed: bool
     in_channels: int
     out_channels: int
-    kernel_size: Tuple[int, ...]
+    kernel_size: tuple[int, ...]
     weight: UninitializedParameter
     bias: UninitializedParameter
 
@@ -1396,7 +1433,8 @@ class _LazyConvXdMixin(LazyModuleMixin):
             self.in_channels = self._get_in_channels(input)
             if self.in_channels % self.groups != 0:
                 raise ValueError("in_channels must be divisible by groups")
-            assert isinstance(self.weight, UninitializedParameter)
+            if not isinstance(self.weight, UninitializedParameter):
+                raise AssertionError("self.weight must be an UninitializedParameter")
             if self.transposed:
                 self.weight.materialize(
                     (
@@ -1414,7 +1452,8 @@ class _LazyConvXdMixin(LazyModuleMixin):
                     )
                 )
             if self.bias is not None:
-                assert isinstance(self.bias, UninitializedParameter)
+                if not isinstance(self.bias, UninitializedParameter):
+                    raise AssertionError("self.bias must be an UninitializedParameter")
                 self.bias.materialize((self.out_channels,))
             self.reset_parameters()
 
@@ -1437,7 +1476,7 @@ class _LazyConvXdMixin(LazyModuleMixin):
         raise NotImplementedError
 
 
-# LazyConv1d defines weight as a Tensor but derived class defines it as UnitializeParameter
+# LazyConv1d defines weight as a Tensor but derived class defines it as UninitializeParameter
 class LazyConv1d(_LazyConvXdMixin, Conv1d):  # type: ignore[misc]
     r"""A :class:`torch.nn.Conv1d` module with lazy initialization of the ``in_channels`` argument.
 
@@ -1453,14 +1492,14 @@ class LazyConv1d(_LazyConvXdMixin, Conv1d):  # type: ignore[misc]
         stride (int or tuple, optional): Stride of the convolution. Default: 1
         padding (int or tuple, optional): Zero-padding added to both sides of
             the input. Default: 0
-        padding_mode (str, optional): ``'zeros'``, ``'reflect'``,
-            ``'replicate'`` or ``'circular'``. Default: ``'zeros'``
         dilation (int or tuple, optional): Spacing between kernel
             elements. Default: 1
         groups (int, optional): Number of blocked connections from input
             channels to output channels. Default: 1
         bias (bool, optional): If ``True``, adds a learnable bias to the
             output. Default: ``True``
+        padding_mode (str, optional): ``'zeros'``, ``'reflect'``,
+            ``'replicate'`` or ``'circular'``. Default: ``'zeros'``
 
     .. seealso:: :class:`torch.nn.Conv1d` and :class:`torch.nn.modules.lazy.LazyModuleMixin`
     """
@@ -1478,11 +1517,12 @@ class LazyConv1d(_LazyConvXdMixin, Conv1d):  # type: ignore[misc]
         dilation: _size_1_t = 1,
         groups: int = 1,
         bias: bool = True,
-        padding_mode: str = "zeros",
+        padding_mode: Literal["zeros", "reflect", "replicate", "circular"] = "zeros",
         device=None,
         dtype=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
+        # pyrefly: ignore [bad-argument-type]
         super().__init__(
             0,
             0,
@@ -1497,16 +1537,18 @@ class LazyConv1d(_LazyConvXdMixin, Conv1d):  # type: ignore[misc]
             padding_mode,
             **factory_kwargs,
         )
+        # pyrefly: ignore [bad-override, bad-argument-type]
         self.weight = UninitializedParameter(**factory_kwargs)
         self.out_channels = out_channels
         if bias:
+            # pyrefly: ignore [bad-override, bad-argument-type]
             self.bias = UninitializedParameter(**factory_kwargs)
 
     def _get_num_spatial_dims(self) -> int:
         return 1
 
 
-# LazyConv2d defines weight as a Tensor but derived class defines it as UnitializeParameter
+# LazyConv2d defines weight as a Tensor but derived class defines it as UninitializeParameter
 class LazyConv2d(_LazyConvXdMixin, Conv2d):  # type: ignore[misc]
     r"""A :class:`torch.nn.Conv2d` module with lazy initialization of the ``in_channels`` argument.
 
@@ -1522,14 +1564,14 @@ class LazyConv2d(_LazyConvXdMixin, Conv2d):  # type: ignore[misc]
         stride (int or tuple, optional): Stride of the convolution. Default: 1
         padding (int or tuple, optional): Zero-padding added to both sides of
             the input. Default: 0
-        padding_mode (str, optional): ``'zeros'``, ``'reflect'``,
-            ``'replicate'`` or ``'circular'``. Default: ``'zeros'``
         dilation (int or tuple, optional): Spacing between kernel
             elements. Default: 1
         groups (int, optional): Number of blocked connections from input
             channels to output channels. Default: 1
         bias (bool, optional): If ``True``, adds a learnable bias to the
             output. Default: ``True``
+        padding_mode (str, optional): ``'zeros'``, ``'reflect'``,
+            ``'replicate'`` or ``'circular'``. Default: ``'zeros'``
 
     .. seealso:: :class:`torch.nn.Conv2d` and :class:`torch.nn.modules.lazy.LazyModuleMixin`
     """
@@ -1547,11 +1589,12 @@ class LazyConv2d(_LazyConvXdMixin, Conv2d):  # type: ignore[misc]
         dilation: _size_2_t = 1,
         groups: int = 1,
         bias: bool = True,
-        padding_mode: str = "zeros",  # TODO: refine this type
+        padding_mode: Literal["zeros", "reflect", "replicate", "circular"] = "zeros",
         device=None,
         dtype=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
+        # pyrefly: ignore [bad-argument-type]
         super().__init__(
             0,
             0,
@@ -1566,16 +1609,18 @@ class LazyConv2d(_LazyConvXdMixin, Conv2d):  # type: ignore[misc]
             padding_mode,
             **factory_kwargs,
         )
+        # pyrefly: ignore [bad-override, bad-argument-type]
         self.weight = UninitializedParameter(**factory_kwargs)
         self.out_channels = out_channels
         if bias:
+            # pyrefly: ignore [bad-override, bad-argument-type]
             self.bias = UninitializedParameter(**factory_kwargs)
 
     def _get_num_spatial_dims(self) -> int:
         return 2
 
 
-# LazyConv3d defines weight as a Tensor but derived class defines it as UnitializeParameter
+# LazyConv3d defines weight as a Tensor but derived class defines it as UninitializeParameter
 class LazyConv3d(_LazyConvXdMixin, Conv3d):  # type: ignore[misc]
     r"""A :class:`torch.nn.Conv3d` module with lazy initialization of the ``in_channels`` argument.
 
@@ -1592,14 +1637,14 @@ class LazyConv3d(_LazyConvXdMixin, Conv3d):  # type: ignore[misc]
         stride (int or tuple, optional): Stride of the convolution. Default: 1
         padding (int or tuple, optional): Zero-padding added to both sides of
             the input. Default: 0
-        padding_mode (str, optional): ``'zeros'``, ``'reflect'``,
-            ``'replicate'`` or ``'circular'``. Default: ``'zeros'``
         dilation (int or tuple, optional): Spacing between kernel
             elements. Default: 1
         groups (int, optional): Number of blocked connections from input
             channels to output channels. Default: 1
         bias (bool, optional): If ``True``, adds a learnable bias to the
             output. Default: ``True``
+        padding_mode (str, optional): ``'zeros'``, ``'reflect'``,
+            ``'replicate'`` or ``'circular'``. Default: ``'zeros'``
 
     .. seealso:: :class:`torch.nn.Conv3d` and :class:`torch.nn.modules.lazy.LazyModuleMixin`
     """
@@ -1617,11 +1662,12 @@ class LazyConv3d(_LazyConvXdMixin, Conv3d):  # type: ignore[misc]
         dilation: _size_3_t = 1,
         groups: int = 1,
         bias: bool = True,
-        padding_mode: str = "zeros",
+        padding_mode: Literal["zeros", "reflect", "replicate", "circular"] = "zeros",
         device=None,
         dtype=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
+        # pyrefly: ignore [bad-argument-type]
         super().__init__(
             0,
             0,
@@ -1636,16 +1682,18 @@ class LazyConv3d(_LazyConvXdMixin, Conv3d):  # type: ignore[misc]
             padding_mode,
             **factory_kwargs,
         )
+        # pyrefly: ignore [bad-override, bad-argument-type]
         self.weight = UninitializedParameter(**factory_kwargs)
         self.out_channels = out_channels
         if bias:
+            # pyrefly: ignore [bad-override, bad-argument-type]
             self.bias = UninitializedParameter(**factory_kwargs)
 
     def _get_num_spatial_dims(self) -> int:
         return 3
 
 
-# LazyConvTranspose1d defines weight as a Tensor but derived class defines it as UnitializeParameter
+# LazyConvTranspose1d defines weight as a Tensor but derived class defines it as UninitializeParameter
 class LazyConvTranspose1d(_LazyConvXdMixin, ConvTranspose1d):  # type: ignore[misc]
     r"""A :class:`torch.nn.ConvTranspose1d` module with lazy initialization of the ``in_channels`` argument.
 
@@ -1685,11 +1733,12 @@ class LazyConvTranspose1d(_LazyConvXdMixin, ConvTranspose1d):  # type: ignore[mi
         groups: int = 1,
         bias: bool = True,
         dilation: _size_1_t = 1,
-        padding_mode: str = "zeros",
+        padding_mode: Literal["zeros", "reflect", "replicate", "circular"] = "zeros",
         device=None,
         dtype=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
+        # pyrefly: ignore [bad-argument-type]
         super().__init__(
             0,
             0,
@@ -1705,16 +1754,18 @@ class LazyConvTranspose1d(_LazyConvXdMixin, ConvTranspose1d):  # type: ignore[mi
             padding_mode,
             **factory_kwargs,
         )
+        # pyrefly: ignore [bad-override, bad-argument-type]
         self.weight = UninitializedParameter(**factory_kwargs)
         self.out_channels = out_channels
         if bias:
+            # pyrefly: ignore [bad-override, bad-argument-type]
             self.bias = UninitializedParameter(**factory_kwargs)
 
     def _get_num_spatial_dims(self) -> int:
         return 1
 
 
-# LazyConvTranspose2d defines weight as a Tensor but derived class defines it as UnitializeParameter
+# LazyConvTranspose2d defines weight as a Tensor but derived class defines it as UninitializeParameter
 class LazyConvTranspose2d(_LazyConvXdMixin, ConvTranspose2d):  # type: ignore[misc]
     r"""A :class:`torch.nn.ConvTranspose2d` module with lazy initialization of the ``in_channels`` argument.
 
@@ -1754,11 +1805,12 @@ class LazyConvTranspose2d(_LazyConvXdMixin, ConvTranspose2d):  # type: ignore[mi
         groups: int = 1,
         bias: bool = True,
         dilation: int = 1,
-        padding_mode: str = "zeros",
+        padding_mode: Literal["zeros", "reflect", "replicate", "circular"] = "zeros",
         device=None,
         dtype=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
+        # pyrefly: ignore [bad-argument-type]
         super().__init__(
             0,
             0,
@@ -1774,16 +1826,18 @@ class LazyConvTranspose2d(_LazyConvXdMixin, ConvTranspose2d):  # type: ignore[mi
             padding_mode,
             **factory_kwargs,
         )
+        # pyrefly: ignore [bad-override, bad-argument-type]
         self.weight = UninitializedParameter(**factory_kwargs)
         self.out_channels = out_channels
         if bias:
+            # pyrefly: ignore [bad-override, bad-argument-type]
             self.bias = UninitializedParameter(**factory_kwargs)
 
     def _get_num_spatial_dims(self) -> int:
         return 2
 
 
-# LazyConvTranspose3d defines weight as a Tensor but derived class defines it as UnitializeParameter
+# LazyConvTranspose3d defines weight as a Tensor but derived class defines it as UninitializeParameter
 class LazyConvTranspose3d(_LazyConvXdMixin, ConvTranspose3d):  # type: ignore[misc]
     r"""A :class:`torch.nn.ConvTranspose3d` module with lazy initialization of the ``in_channels`` argument.
 
@@ -1823,11 +1877,12 @@ class LazyConvTranspose3d(_LazyConvXdMixin, ConvTranspose3d):  # type: ignore[mi
         groups: int = 1,
         bias: bool = True,
         dilation: _size_3_t = 1,
-        padding_mode: str = "zeros",
+        padding_mode: Literal["zeros", "reflect", "replicate", "circular"] = "zeros",
         device=None,
         dtype=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
+        # pyrefly: ignore [bad-argument-type]
         super().__init__(
             0,
             0,
@@ -1843,9 +1898,11 @@ class LazyConvTranspose3d(_LazyConvXdMixin, ConvTranspose3d):  # type: ignore[mi
             padding_mode,
             **factory_kwargs,
         )
+        # pyrefly: ignore [bad-override, bad-argument-type]
         self.weight = UninitializedParameter(**factory_kwargs)
         self.out_channels = out_channels
         if bias:
+            # pyrefly: ignore [bad-override, bad-argument-type]
             self.bias = UninitializedParameter(**factory_kwargs)
 
     def _get_num_spatial_dims(self) -> int:

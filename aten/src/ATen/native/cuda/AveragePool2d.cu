@@ -135,7 +135,7 @@ __global__ void avg_pool2d_backward_out_cuda_frame(const index_t nthreads, const
     const int stride_w, const int pad_h, const int pad_w,
     scalar_t* const bottom_diff, const int divisor_override,
     bool count_include_pad, bool use_divisor) {
-  CUDA_KERNEL_LOOP(index, nthreads) {
+  CUDA_KERNEL_LOOP_TYPE(index, nthreads, index_t) {
     // find out the local index
     // find out the local offset
     const int w = index % width + pad_w;
@@ -192,7 +192,7 @@ __global__ void avg_pool2d_backward_out_cuda_frame_nhwc(const index_t nthreads,
     const int stride_w, const int pad_h, const int pad_w,
     scalar_t* const bottom_diff, const int divisor_override,
     bool count_include_pad, bool use_divisor) {
-  CUDA_KERNEL_LOOP(index, nthreads) {
+  CUDA_KERNEL_LOOP_TYPE(index, nthreads, index_t) {
     const int c = index % channels;
     const int w = (index / channels) % width;
     const int h = (index / channels / width) % height;
@@ -399,15 +399,22 @@ TORCH_IMPL_FUNC(avg_pool2d_backward_out_cuda) (
     return;
   }
 
-  const uint32_t num_threads = std::min(at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock, 1024);
-  const uint32_t num_blocks = ceil_div<uint32_t>(count, num_threads);
-
   bool use_divisor = divisor_override.has_value();
   const auto divisor_override_value = use_divisor ? divisor_override.value() : 0;
+
+  cudaDeviceProp* properties = at::cuda::getCurrentDeviceProperties();
+  const bool gesm10x = properties->major >= 10;
+  int double_threads = 1024;
+  if (gesm10x) {
+    double_threads = 768;
+  }
 
   AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, input.scalar_type(),
     "avg_pool2d_backward_out_cuda_frame",
     [&] {
+      const uint32_t num_threads = std::min(at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock, std::is_same<scalar_t, double>::value ? double_threads : 1024);
+      const uint32_t num_blocks = ceil_div<uint32_t>(count, num_threads);
+
       using accscalar_t = acc_type<scalar_t, true>;
 
       const scalar_t *gradOutput_data = gradOutput.const_data_ptr<scalar_t>();

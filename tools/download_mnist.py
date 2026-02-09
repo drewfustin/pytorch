@@ -5,9 +5,9 @@ import sys
 from urllib.error import URLError
 from urllib.request import urlretrieve
 
+
 MIRRORS = [
-    "http://yann.lecun.com/exdb/mnist/",
-    "https://ossci-datasets.s3.amazonaws.com/mnist/",
+    "https://ossci-datasets.s3.amazonaws.com/mnist/",  # @lint-ignore
 ]
 
 RESOURCES = [
@@ -24,6 +24,7 @@ def report_download_progress(
     file_size: int,
 ) -> None:
     if file_size != -1:
+        # pyrefly: ignore [no-matching-overload]
         percent = min(1, (chunk_number * chunk_size) / file_size)
         bar = "#" * int(64 * percent)
         sys.stdout.write(f"\r0% |{bar:<64}| {int(percent * 100)}%")

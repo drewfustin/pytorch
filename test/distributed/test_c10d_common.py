@@ -3,19 +3,22 @@
 import copy
 import os
 import pickle
+import subprocess
 import sys
 import tempfile
 import threading
 import time
+import unittest
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from itertools import product
 from sys import platform
-from typing import Callable, Dict, Optional
+from typing import Optional
 
 import torch
 import torch.distributed as dist
+
 
 if not dist.is_available():
     print("distributed package not available, skipping tests", file=sys.stderr)
@@ -26,8 +29,6 @@ import torch.distributed.distributed_c10d as c10d
 import torch.nn.functional as F
 import torch.testing._internal.common_utils as common
 from torch import nn
-from torch.distributed._spmd.comm_tensor import _wait_comm, CommTensor
-from torch.fx.experimental.proxy_tensor import make_fx
 from torch.nn.parallel import DistributedDataParallel
 from torch.testing._internal.common_distributed import (
     MultiProcessTestCase,
@@ -35,11 +36,14 @@ from torch.testing._internal.common_distributed import (
 )
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
+    IS_FBCODE,
+    IS_SANDCASTLE,
     load_tests,
     parametrize,
     retry_on_connect_failures,
     run_tests,
     TEST_WITH_DEV_DBG_ASAN,
+    TEST_XPU,
     TestCase,
 )
 from torch.utils.checkpoint import checkpoint
@@ -51,7 +55,7 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 # load_tests from common_utils is used to automatically filter tests for
 # sharding on sandcastle. This line silences flake warnings
-load_tests = load_tests
+load_tests = load_tests  # noqa: PLW0127
 
 if platform == "darwin":
     LOOPBACK = "lo0"
@@ -60,6 +64,8 @@ else:
 
 torch.backends.cuda.matmul.allow_tf32 = False
 
+device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else "cpu"
+
 
 def gpus_for_rank(world_size):
     """Multigpu tests are designed to simulate the multi nodes with multi
@@ -67,8 +73,9 @@ def gpus_for_rank(world_size):
     On a single node, all visible GPUs are evenly
     divided to subsets, each process only uses a subset.
     """
-    visible_devices = list(range(torch.cuda.device_count()))
-    gpus_per_process = torch.cuda.device_count() // world_size
+    device_count = torch.accelerator.device_count()
+    visible_devices = list(range(device_count))
+    gpus_per_process = device_count // world_size
     gpus_for_rank = []
     for rank in range(world_size):
         gpus_for_rank.append(
@@ -89,7 +96,7 @@ class AbstractTimeoutTest:
             )
             default_store = c10d._get_default_store()
             tik = time.time()
-            with self.assertRaisesRegex(RuntimeError, "Timeout"):
+            with self.assertRaisesRegex(RuntimeError, "(?i)timeout"):
                 default_store.get("nonexistent key")
             tok = time.time()
             dist.destroy_process_group()
@@ -100,14 +107,13 @@ class AbstractTimeoutTest:
             c2p.append(e)
 
     def _init_methods(self):
-        f = tempfile.NamedTemporaryFile(delete=False)
-        if sys.platform == "win32":
-            yield "file:///{}".format(f.name.replace("\\", "/"))
+        with tempfile.NamedTemporaryFile(delete=False) as f:
             f.close()
-        else:
-            yield f"file://{f.name}"
-            f.close()
-            yield "tcp://127.0.0.1:%d" % common.find_free_port()
+            if sys.platform == "win32":
+                yield "file:///{}".format(f.name.replace("\\", "/"))
+            else:
+                yield f"file://{f.name}"
+                yield f"tcp://127.0.0.1:{common.find_free_port():d}"
 
     def _test_default_store_timeout(self, backend):
         for init_method in self._init_methods():
@@ -133,7 +139,8 @@ class AbstractTimeoutTest:
 class TimeoutTest(TestCase):
     @retry_on_connect_failures
     def test_store_based_barrier(self):
-        f = tempfile.NamedTemporaryFile(delete=False)
+        f = tempfile.NamedTemporaryFile(delete=False)  # noqa: SIM115
+        f.close()
         port = common.find_free_port()
 
         def thread_work(timeout, init_type, world_size, rank, error_list):
@@ -183,7 +190,7 @@ class TimeoutTest(TestCase):
                 threads.append(t)
                 t.start()
 
-            for i, thread in enumerate(threads):
+            for thread in threads:
                 thread.join()
 
             # we expect the world_size-1 threads to have failed
@@ -198,7 +205,7 @@ class TimeoutTest(TestCase):
 
 
 class Net(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.fc1 = nn.Linear(2, 10, bias=False)
         self.fc2 = nn.Linear(10, 50, bias=False)
@@ -290,8 +297,25 @@ class ConvNet(nn.Module):
         return self.conv3(x)
 
 
+# A model involving FFTs, used to test DDP with complex tensors
+class FFTModel(nn.Module):
+    def __init__(self, hin, win, n_features):
+        super().__init__()
+        self.hin = hin
+        self.win = win
+        self.weight = nn.Parameter(
+            torch.ones((n_features, n_features, hin, win // 2 + 1), dtype=torch.cfloat)
+        )
+
+    def forward(self, x):
+        xc = torch.fft.rfft2(x, s=(self.hin, self.win), dim=(-2, -1), norm="ortho")
+        xcw = torch.einsum("nchw,cohw->nohw", xc, self.weight)
+        x = torch.fft.irfft2(xcw, dim=(-2, -1), norm="ortho")
+        return x
+
+
 class Task(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.p = nn.Parameter(torch.ones(2, 2))
 
@@ -300,7 +324,7 @@ class Task(nn.Module):
 
 
 class ModuleForDdpCommHook(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.t0 = Task()
 
@@ -309,7 +333,7 @@ class ModuleForDdpCommHook(nn.Module):
 
 
 class SparseGradientModule(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.embedding = nn.EmbeddingBag(10, 10, sparse=True)
 
@@ -324,7 +348,7 @@ class CommonDistributedDataParallelTest:
         # Use this hack to remove files for that test
         try:
             os.remove(self.file_name)
-        except OSError:
+        except (OSError, AttributeError):
             pass
 
     @property
@@ -340,7 +364,7 @@ class CommonDistributedDataParallelTest:
         gradient_as_bucket_view=False,
     ):
         model = Net()
-        device = devices[0] if devices else torch.device("cuda:%d" % self.rank)
+        device = devices[0] if devices else torch.device(f"cuda:{self.rank:d}")
         ddp_model = DistributedDataParallel(
             copy.deepcopy(model).to(device),
             device_ids=device_ids,
@@ -381,7 +405,7 @@ class CommonDistributedDataParallelTest:
             gradient_as_bucket_view=gradient_as_bucket_view,
         )
 
-        input = torch.randn(global_batch_size, 2).cuda(devices[0])
+        input = torch.randn(global_batch_size, 2).to(devices[0])
         target = torch.randn(global_batch_size, 4)
 
         return model, ddp_model, input, target
@@ -415,10 +439,10 @@ class CommonDistributedDataParallelTest:
         allow_none_grads=False,
     ):
         # to reproduce the same training results
-        torch.cuda.set_device(self.rank)
+        torch.accelerator.set_device_index(self.rank)
         torch.manual_seed(31415)
-        model = copy.deepcopy(input_model).cuda()
-        ddp_model = copy.deepcopy(input_model).cuda()
+        model = copy.deepcopy(input_model).to(device_type)
+        ddp_model = copy.deepcopy(input_model).to(device_type)
         ddp_model = nn.parallel.DistributedDataParallel(
             ddp_model,
             bucket_cap_mb=1,
@@ -534,8 +558,8 @@ class CommonDistributedDataParallelTest:
     def _prepare_dummy_data(self):
         ddp_bs = 16
         bs = ddp_bs * self.world_size
-        input = torch.rand((bs, 20), device="cuda", requires_grad=True)
-        target = torch.randn((bs, 20), device="cuda")
+        input = torch.rand((bs, 20), device=device_type, requires_grad=True)
+        target = torch.randn((bs, 20), device=device_type)
         offset = self.rank * ddp_bs
         ddp_input = input[offset : offset + ddp_bs]
         ddp_target = target[offset : offset + ddp_bs]
@@ -584,14 +608,14 @@ class CommonDistributedDataParallelTest:
                 )
             )
             with err_ctx:
-                model = self._test_ddp_checkpointing(
+                self._test_ddp_checkpointing(
                     self.CheckpointOnceModule(use_reentrant=use_reentrant),
                     process_group=process_group,
                     use_bucket_view=use_bucket_view,
                     find_unused_parameters=True,
                 )
             # test passes when static_graph is true
-            model = self._test_ddp_checkpointing(
+            self._test_ddp_checkpointing(
                 self.CheckpointOnceModule(use_reentrant=use_reentrant),
                 process_group=process_group,
                 use_bucket_view=use_bucket_view,
@@ -616,7 +640,7 @@ class CommonDistributedDataParallelTest:
                 )
             )
             with err_ctx:
-                model = self._test_ddp_checkpointing(
+                self._test_ddp_checkpointing(
                     self.CheckpointTwiceModule(use_reentrant=use_reentrant),
                     process_group=process_group,
                     use_bucket_view=use_bucket_view,
@@ -624,7 +648,7 @@ class CommonDistributedDataParallelTest:
                 )
 
             with err_ctx:
-                model = self._test_ddp_checkpointing(
+                self._test_ddp_checkpointing(
                     self.CheckpointTwiceModule(use_reentrant=use_reentrant),
                     process_group=process_group,
                     use_bucket_view=use_bucket_view,
@@ -642,7 +666,7 @@ class CommonDistributedDataParallelTest:
         process_group = self._get_process_group()
         for use_bucket_view in (True, False):
             # Test passes when static_graph=True.
-            model = self._test_ddp_checkpointing(
+            self._test_ddp_checkpointing(
                 self.CheckpointTwiceModule(use_reentrant=use_reentrant),
                 process_group=process_group,
                 use_bucket_view=use_bucket_view,
@@ -657,7 +681,7 @@ class CommonDistributedDataParallelTest:
         """
         process_group = self._get_process_group()
         for use_bucket_view in (True, False):
-            model = self._test_ddp_checkpointing(
+            self._test_ddp_checkpointing(
                 self.DynamicCheckpointTwiceModule(use_reentrant=False),
                 process_group=process_group,
                 use_bucket_view=use_bucket_view,
@@ -676,7 +700,7 @@ class CommonDistributedDataParallelTest:
         """
         process_group = self._get_process_group()
         for use_bucket_view in (True, False):
-            model = self._test_ddp_checkpointing(
+            self._test_ddp_checkpointing(
                 self.DynamicCheckpointTwiceModuleWeightSharing(use_reentrant=False),
                 process_group=process_group,
                 use_bucket_view=use_bucket_view,
@@ -695,7 +719,7 @@ class CommonDistributedDataParallelTest:
         Test that checkpointing with weight sharing works.
         """
         process_group = self._get_process_group()
-        torch.cuda.set_device(self.rank)
+        torch.accelerator.set_device_index(self.rank)
         for use_bucket_view, static_graph in product((False, True), (False, True)):
             torch.manual_seed(31415)
             l1 = nn.Linear(20, 20)
@@ -718,9 +742,9 @@ class CommonDistributedDataParallelTest:
         same layer twice and having weights shared across layers.
         """
         process_group = self._get_process_group()
-        torch.cuda.set_device(self.rank)
+        torch.accelerator.set_device_index(self.rank)
         for use_bucket_view in (True, False):
-            model = self._test_ddp_checkpointing(
+            self._test_ddp_checkpointing(
                 self.CheckpointTwiceModuleWeightSharing(),
                 process_group=process_group,
                 use_bucket_view=use_bucket_view,
@@ -738,7 +762,7 @@ class CommonDistributedDataParallelTest:
                 "Expect `start_powerSGD_iter` > 1 if `use_error_feedback` or `warm_start` is enabled, "
                 "because PowerSGD can only be applied after the first two iterations in DDP.",
             ):
-                state = powerSGD.PowerSGDState(
+                powerSGD.PowerSGDState(
                     process_group=None,
                     matrix_approximation_rank=1,
                     start_powerSGD_iter=start_powerSGD_iter,
@@ -973,7 +997,7 @@ class CommonDistributedDataParallelTest:
     @dataclass
     class CustomOutput:
         o1: Optional[torch.Tensor]
-        o2: Dict[str, torch.Tensor]
+        o2: dict[str, torch.Tensor]
 
     class DataclassOutputModule(nn.Module):
         def __init__(self, skip_o1):
@@ -1009,15 +1033,19 @@ class CommonDistributedDataParallelTest:
         ddp_out = ddp(ddp_x)
 
         net_loss = F.mse_loss(
-            net_out.o1 + net_out.o2["a"] + net_out.o2["b"]
-            if not skip_o1
-            else net_out.o2["a"] + net_out.o2["b"],
+            (
+                net_out.o1 + net_out.o2["a"] + net_out.o2["b"]
+                if not skip_o1
+                else net_out.o2["a"] + net_out.o2["b"]
+            ),
             torch.ones_like(net_out.o2["a"], device=self.rank),
         )
         ddp_loss = F.mse_loss(
-            ddp_out.o1 + ddp_out.o2["a"] + ddp_out.o2["b"]
-            if not skip_o1
-            else ddp_out.o2["a"] + ddp_out.o2["b"],
+            (
+                ddp_out.o1 + ddp_out.o2["a"] + ddp_out.o2["b"]
+                if not skip_o1
+                else ddp_out.o2["a"] + ddp_out.o2["b"]
+            ),
             torch.ones_like(ddp_out.o2["a"], device=self.rank),
         )
 
@@ -1138,7 +1166,7 @@ class AbstractCommTest:
 
         # Verify sequence numbers are appropriately incremented
         for i in range(10):
-            t = torch.ones(1, device=torch.cuda.current_device())
+            t = torch.ones(1, device=device_type)
             dist.all_reduce(t, group=process_group)
             if not c10d._rank_not_in_group(process_group):
                 seq_num = self._verify_sequence_number_across_pg(
@@ -1161,15 +1189,13 @@ class AbstractCommTest:
                 self.assertEqual(len(set(rank_to_seq_num.values())), 2)
                 self.assertEqual(rank_to_seq_num[0], rank_to_seq_num[2])
                 expected_same = {
-                    rank_to_seq_num[i]
-                    for i in rank_to_seq_num.keys()
-                    if i not in [0, 2]
+                    rank_to_seq_num[i] for i in rank_to_seq_num if i not in [0, 2]
                 }
                 self.assertEqual(len(expected_same), 1)
                 self.assertEqual(rank_to_seq_num[0] + 1, rank_to_seq_num[1])
 
     def _test_sequence_num_incremented_default_group(self, backend_name):
-        torch.cuda.set_device(self.rank)
+        torch.accelerator.set_device_index(self.rank)
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend_name,
@@ -1183,7 +1209,7 @@ class AbstractCommTest:
         )
 
     def _test_sequence_num_incremented_subgroup(self, backend_name):
-        torch.cuda.set_device(self.rank)
+        torch.accelerator.set_device_index(self.rank)
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend_name,
@@ -1238,8 +1264,8 @@ class AbstractCommTest:
         in_group_ranks = list(filter(lambda x: x % 2 == 0, range(self.world_size)))
         group = dist.new_group(in_group_ranks)
 
-        x = torch.zeros(2, 2).cuda(self.rank)
-        xs = [torch.zeros(2, 2).cuda(self.rank) for _ in range(len(in_group_ranks))]
+        x = torch.zeros(2, 2).to(self.rank)
+        xs = [torch.zeros(2, 2).to(self.rank) for _ in range(len(in_group_ranks))]
         if self.rank not in in_group_ranks:
             msg = ".*{}.*does not belong to.*"
             with self.assertWarnsOnceRegex(UserWarning, msg.format("all_gather")):
@@ -1368,7 +1394,7 @@ class AbstractCommTest:
             rank=self.rank,
             store=store,
         )
-        device = "cuda" if backend == "nccl" else "cpu"
+        device = "cuda" if backend == "nccl" else "xpu" if backend == "xccl" else "cpu"
         # test alltoall_base
         tensor = torch.tensor([1, 0, 0, 1], dtype=torch.bool, device=device)
         zeros = torch.tensor([0, 0, 0, 0], dtype=torch.bool, device=device)
@@ -1530,7 +1556,7 @@ class CommTest(AbstractCommTest, MultiProcessTestCase):
         }
         invalid_debug_modes = ["foo", 0, 1, -1]
 
-        for mode in mapping.keys():
+        for mode in mapping:
             os.environ["TORCH_DISTRIBUTED_DEBUG"] = str(mode)
             dist.set_debug_level_from_env()
             set_debug_mode = dist.get_debug_level()
@@ -1550,12 +1576,53 @@ class CommTest(AbstractCommTest, MultiProcessTestCase):
 
 class DummyWork(dist._Work):
     def wait(self, timeout=5.0):
-        if torch.cuda.is_available():
-            torch.cuda.current_stream().synchronize()
+        if torch.accelerator.is_available():
+            torch.accelerator.current_stream().synchronize()
         return True
 
 
 class DummyProcessGroup(dist.ProcessGroup):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._bound_device_id = None
+        self.global_rank = args[0]
+        self.group_size = args[1]
+        self._aborted = False
+        self._shutdown = False
+
+    def rank(self):
+        return self.global_rank
+
+    def size(self):
+        return self.group_size
+
+    @property
+    def supports_splitting(self):
+        return True
+
+    @property
+    def bound_device_id(self):
+        return self._bound_device_id
+
+    @bound_device_id.setter
+    def bound_device_id(self, device):
+        self._bound_device_id = device
+
+    def eager_connect_single_device(self, device=None):
+        self._bound_device_id = device
+
+    def _set_sequence_number_for_group(self):
+        pass
+
+    def _get_backend(self, device):
+        return self
+
+    def comm_split_count(self):
+        return 0
+
+    def perform_nocolor_split(self, device):
+        pass
+
     def getBackendName(self):
         return "Dummy"
 
@@ -1619,6 +1686,12 @@ class DummyProcessGroup(dist.ProcessGroup):
 
         return DummyWork()
 
+    def abort(self) -> None:
+        self._aborted = True
+
+    def shutdown(self) -> None:
+        self._shutdown = True
+
 
 class PythonProcessGroupExtensionTest(MultiProcessTestCase):
     def setUp(self):
@@ -1635,6 +1708,51 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
     def test_get_backend_name(self):
         dpg = DummyProcessGroup(0, 1)
         self.assertEqual("Dummy", dpg.name())
+
+        # dist.Backend.register_backend(
+        #     "dummy", PythonProcessGroupExtensionTest.create_dummy
+        # )
+
+        # # os.environ["MASTER_ADDR"] = "localhost"
+        # # os.environ["MASTER_PORT"] = "6789"
+        # # dist.init_process_group(
+        # #     "cpu:dummy", rank=0, world_size=1,
+        # # )
+        # dpg = DummyProcessGroup(0, 1)
+        # from torch.distributed.distributed_c10d import _canonicalize_group_rank
+        # self.assertEqual(123, _canonicalize_group_rank(dpg, group_rank=123, return_global=False))
+        # with self.assertRaises(RuntimeError):
+        # _canonicalize_group_rank(dpg, group_rank=123, return_global=True)
+
+    def test_canonicalize_helper(self):
+        dist.Backend.register_backend(
+            "dummy", PythonProcessGroupExtensionTest.create_dummy
+        )
+
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "6789"
+        dist.init_process_group("dummy", rank=self.rank, world_size=self.world_size)
+
+        dpg = DummyProcessGroup(0, 124)
+        from torch.distributed.distributed_c10d import _canonicalize_group_rank
+
+        # we ensure that a process group with more ranks than the 'default' group can still be used.
+        # e.g. if the dpg had 124 ranks and the world had only 2 ranks.
+        self.assertEqual(
+            123, _canonicalize_group_rank(dpg, group_rank=123, return_global=False)
+        )
+        self.assertEqual(
+            0, _canonicalize_group_rank(dpg, global_rank=0, return_global=True)
+        )
+        with self.assertRaises(ValueError):
+            # TODO(whc) this is actually catching the wrong error:
+            # ValueError: Group <__mp_main__.DummyProcessGroup object at 0x7faa0a844540> is not registered,
+            # please create group with torch.distributed.new_group API
+            # It should be catching a different error where the rank doesn't exist in the global mapping.
+            # But it's still testing the same part of the _canonicalize_group_rank helper so maybe this is fine
+            _canonicalize_group_rank(dpg, group_rank=123, return_global=True)
+
+        dist.destroy_process_group()
 
     def test_backend_class_attr(self):
         dist.Backend.register_backend(
@@ -1674,6 +1792,18 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
             ("cpu:gloo,cuda:nccl", "cpu:gloo,cuda:nccl"),
         ]
 
+        if TEST_XPU:
+            # Override backend_config_strings_and_expected_values for Intel GPU.
+            backend_config_strings_and_expected_values[4:10] = [
+                (dist.Backend.DUMMY, "cpu:dummy,cuda:dummy,xpu:dummy"),
+                ("DUMMY", "cpu:dummy,cuda:dummy,xpu:dummy"),
+                ("dummy", "cpu:dummy,cuda:dummy,xpu:dummy"),
+                ("cpu:dummy,xpu:dummy", "cpu:dummy,xpu:dummy"),
+                ("cpu:dummy,xpu:xccl", "cpu:dummy,xpu:xccl"),
+                ("cpu:gloo,xpu:dummy", "cpu:gloo,xpu:dummy"),
+                ("cpu:gloo,xpu:xccl", "cpu:gloo,xpu:xccl"),
+            ]
+
         for config_str, expected_value in backend_config_strings_and_expected_values:
             with self.subTest(config_str):
                 # ensures these configs strings are valid and no ValueError is raised
@@ -1684,6 +1814,8 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         invalid_backend_config_strings = [
             "cpu:gloo,cuda:nccl,",  # trailing comma
             "cpu:gloo,cuda:nccl,cpu:dummy",  # duplicate device
+            "cpu:gloo,xpu:xccl,",  # trailing comma
+            "cpu:gloo,xpu:xccl,cpu:dummy",  # duplicate device
         ]
         for config_str in invalid_backend_config_strings:
             with self.subTest(config_str):
@@ -1698,7 +1830,7 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "6789"
         dist.init_process_group(
-            "cpu:dummy,cuda:dummy", rank=self.rank, world_size=self.world_size
+            "cpu:dummy,cuda:dummy,xpu:dummy", rank=self.rank, world_size=self.world_size
         )
 
         # test all_gather
@@ -1710,7 +1842,12 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         dist.destroy_process_group()
 
     class Options:
-        def __init__(self):
+        group_name = None
+        split_from = None
+        split_color = None
+        global_ranks_in_group = None
+
+        def __init__(self) -> None:
             pass
 
         def create(self):
@@ -1719,6 +1856,10 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
     @staticmethod
     def create_dummy(store, group_rank, group_size, timeout):
         return DummyProcessGroup(group_rank, group_size)
+
+    @staticmethod
+    def create_dummy_ext(dist_opts, pg_options=None):
+        return DummyProcessGroup(dist_opts.group_rank, dist_opts.group_size)
 
     def test_collectives(self):
         dist.Backend.register_backend(
@@ -1772,15 +1913,54 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
 
         with self.assertRaises(ValueError):
             dist.send(input_tensor, dist.get_rank())
+        with self.assertRaises(ValueError):
+            dist.send(input_tensor, group_dst=dist.get_rank())
+
+        with self.assertRaises(ValueError):
+            dist.send(input_tensor, dist.get_rank(), group_dst=dist.get_rank())
+        with self.assertRaises(ValueError):
+            dist.send(input_tensor)
 
         # test recv
         input_tensor = torch.zeros(2, 2)
         dist.recv(input_tensor, (self.rank + 1) % self.world_size)
         self.assertEqual(input_tensor, torch.zeros(2, 2) + 2)
+        with self.assertRaises(ValueError):
+            dist.recv(input_tensor, src=0, group_src=0)
 
         dist.barrier()
         # intentionally not calling into `destroy_process_group` as not all
         # user applications would explicitly that.
+
+    def test_shutdown(self) -> None:
+        dist.Backend.register_backend(
+            "dummy", PythonProcessGroupExtensionTest.create_dummy
+        )
+
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "6789"
+        dist.init_process_group("dummy", rank=self.rank, world_size=self.world_size)
+
+        pg = c10d._get_default_group()
+
+        dist.destroy_process_group()
+
+        self.assertTrue(pg._shutdown)
+
+    def test_abort(self) -> None:
+        dist.Backend.register_backend(
+            "dummy", PythonProcessGroupExtensionTest.create_dummy
+        )
+
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "6789"
+        dist.init_process_group("dummy", rank=self.rank, world_size=self.world_size)
+
+        pg = c10d._get_default_group()
+
+        c10d._abort_process_group()
+
+        self.assertTrue(pg._aborted)
 
 
 instantiate_parametrized_tests(CommonDistributedDataParallelTest)
@@ -1803,19 +1983,19 @@ class ProcessGroupWithDispatchedCollectivesTests(MultiProcessTestCase):
             pass
 
     def test_init_process_group_optional_backend(self):
-        with tempfile.NamedTemporaryFile(delete=False) as f:
-            store = dist.FileStore(f.name, self.world_size)
-            # creates both gloo and nccl backend
-            if dist.is_gloo_available() and dist.is_nccl_available():
-                dist.init_process_group(
-                    store=store,
-                    rank=self.rank,
-                    world_size=self.world_size,
-                )
-                dist.destroy_process_group()
+        store = dist.FileStore(self.file_name, self.world_size)
+        # creates both gloo and nccl backend
+        if dist.is_gloo_available() and dist.is_nccl_available():
+            dist.init_process_group(
+                store=store,
+                rank=self.rank,
+                world_size=self.world_size,
+            )
+            dist.destroy_process_group()
 
     def test_init_process_group_for_all_backends(self):
         for backend in dist.Backend.backend_list:
+            excepted_backend = backend
             # skip if the backend is not available on the system
             if backend == dist.Backend.UNDEFINED:
                 continue
@@ -1823,7 +2003,7 @@ class ProcessGroupWithDispatchedCollectivesTests(MultiProcessTestCase):
                 if not dist.is_mpi_available():
                     continue
             elif backend == dist.Backend.NCCL:
-                if not dist.is_nccl_available():
+                if not dist.is_nccl_available() or not torch.cuda.is_available():
                     continue
             elif backend == dist.Backend.GLOO:
                 if not dist.is_gloo_available():
@@ -1831,41 +2011,78 @@ class ProcessGroupWithDispatchedCollectivesTests(MultiProcessTestCase):
             elif backend == dist.Backend.UCC:
                 if not dist.is_ucc_available():
                     continue
+            elif backend == dist.Backend.XCCL:
+                if not dist.is_xccl_available():
+                    continue
+            # Multi-threaded PG is defined as a pure python class.
+            # Its pg.name() does not going through Pybind, so its backend name
+            # is still "threaded" instead of "custom".
+            elif backend != "threaded":
+                excepted_backend = "custom"
 
-            with tempfile.NamedTemporaryFile(delete=False) as f:
-                store = dist.FileStore(f.name, self.world_size)
-                dist.init_process_group(
-                    backend=backend,
-                    rank=self.rank,
-                    world_size=self.world_size,
-                    store=store,
-                )
-                pg = c10d._get_default_group()
-                self.assertEqual(pg.rank(), self.rank)
-                self.assertEqual(pg.size(), self.world_size)
-                self.assertEqual(pg.name(), str(backend))
+            store = dist.FileStore(self.file_name, self.world_size)
+            dist.init_process_group(
+                backend=backend,
+                rank=self.rank,
+                world_size=self.world_size,
+                store=store,
+            )
+            pg = c10d._get_default_group()
+            self.assertEqual(pg.rank(), self.rank)
+            self.assertEqual(pg.size(), self.world_size)
+            self.assertEqual(pg.name(), str(excepted_backend))
 
-                dist.destroy_process_group()
+            dist.destroy_process_group()
+
+    @unittest.skipIf(IS_FBCODE or IS_SANDCASTLE, "subprocess test fails in fbcode")
+    def test_default_process_group(self):
+        script = """
+# Hide all GPUs
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+import torch
+from torch import distributed as dist
+
+# This should initialize on CPU even though this is a CUDA-enabled build
+dist.init_process_group(rank=0, world_size=1, store=dist.HashStore())
+"""
+        try:
+            subprocess.check_output(
+                [sys.executable, "-c", script],
+                stderr=subprocess.STDOUT,
+                # On Windows, opening the subprocess with the default CWD makes `import torch`
+                # fail, so just set CWD to this script's directory
+                cwd=os.path.dirname(os.path.realpath(__file__)),
+                # It is ok to have an extra long timeout here as a timeout means the test failed
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail(
+                msg="Example code timed out! See the code sample in the test for details."
+            )
+        except subprocess.CalledProcessError as e:
+            self.fail(f"""Subprocess failed with {e.output.decode("utf-8")}""")
 
     def _call_collective_with_varying_tensors(self, backend, collective, *args):
         # call collective with varying tensors to ensure that the tensors are
         # correctly dispatched
 
         # TODO: this will be updated in the future to not be backend specific
-        device = "cuda" if backend == "nccl" else "cpu"
+        device = "cuda" if backend == "nccl" else "xpu" if backend == "xccl" else "cpu"
         # ensure supported devices (cpu, cuda) succeeds during dispatch call
         tensor = torch.zeros(2, 2, device=torch.device(device))
         # multi tensor collectives
-        if collective == dist.barrier:
+        if collective is dist.barrier:
             collective()
         elif collective in (dist.all_gather, dist.gather):
             collective([tensor], tensor, *args)
-        elif collective == dist.scatter:
+        elif collective is dist.scatter:
             collective(tensor, [tensor], *args)
         elif collective in (dist.reduce_scatter, dist.all_to_all):
             # gloo does not support reduce_scatter or all_to_all
             if backend != "gloo":
-                if collective == dist.reduce_scatter:
+                if collective is dist.reduce_scatter:
                     collective(tensor, [tensor], *args)
                 else:
                     collective([tensor], [tensor], *args)
@@ -1918,192 +2135,15 @@ class ProcessGroupWithDispatchedCollectivesTests(MultiProcessTestCase):
             rank=self.rank,
             store=store,
         )
-        device = "cuda" if backend == "nccl" else "cpu"
+        device = "cuda" if backend == "nccl" else "xpu" if backend == "xccl" else "cpu"
         # test alltoall_base
         input_tensor = torch.ones(2, 2, device=torch.device(device))
         output_tensor = torch.zeros(2, 2, device=torch.device(device))
         dist.all_to_all_single(output_tensor, input_tensor)
 
-
-class CompilerTest(MultiProcessTestCase):
-    def setUp(self):
-        super().setUp()
-        self._spawn_processes()
-
-    def tearDown(self):
-        super().tearDown()
-        try:
-            os.remove(self.file_name)
-        except OSError:
-            pass
-
-    def _get_process_group(self):
-        raise NotImplementedError("To be implemented by subclass")
-
-    def _test_work_wait(self, x: torch.Tensor, comm_fn: Callable):
-        pg = self._get_default_group()
-
-        def fn(x: torch.Tensor) -> torch.Tensor:
-            # N.B.: explicitly wrapping with CommTensor instead of updating
-            # all_reduce Python implementation, as the later will need more
-            # discussion.
-            y = CommTensor(x + x)
-            work, z = comm_fn(y, group=pg)
-            # this wait() will be ignored in tracing mode as
-            # ProxyTorchDispatchMode only supports torch.Tensor, _ProxyTensor,
-            # and torch.nn.Parameter objects
-            work.wait()
-            if isinstance(z, list):
-                return [zz * 2 for zz in z]
-            elif isinstance(z, torch.Tensor):
-                return z * 2
-            else:
-                raise RuntimeError("Unexpected return type")
-
-        xx = x.clone()
-
-        # trace fn into a GraphModule
-        traced_fn = make_fx(fn)(xx)
-        traced_fn.graph.lint()
-        traced_fn.graph.eliminate_dead_code()
-
-        # make sure the mul op indeed waits for comm
-        for node in traced_fn.graph.nodes:
-            if node.op == "call_function" and "mul.Tensor" in node.target.__name__:
-                prev = node.args[0]
-                curr = None
-                waited = False
-                commed = False
-                while prev is not None and not commed:
-                    curr = prev
-                    waited |= all(
-                        [
-                            curr.op == "call_function",
-                            curr.target == _wait_comm,
-                        ]
-                    )
-                    commed |= all(
-                        [
-                            curr.op == "call_function",
-                            CommTensor._is_supported(curr.target.__name__),
-                        ]
-                    )
-
-                    prev = curr.args[0]
-
-                self.assertTrue(waited)
-                self.assertTrue(commed)
-
-        # Update input to make sure we are not recording it as constant during
-        # tracing.
-        x += 1
-        xx += 1
-
-        y = fn(x)
-        yy = traced_fn(xx)
-
-        # check correctness
-        self.assertEqual(y, yy)
-
-        xx += 1
-        yy = traced_fn(xx)
-        self.assertNotEqual(y, yy)
-
-    def _test_allreduce_work_wait(self, tensor):
-        def comm_fn(tensor, group=None):
-            work = dist.all_reduce(tensor, group=group, async_op=True)
-            return work, tensor
-
-        self._test_work_wait(tensor, comm_fn=comm_fn)
-
-    def _test_allgather_work_wait(self, tensor):
-        def comm_fn(tensor, group=None):
-            out_tensors = [torch.zeros_like(tensor) for _ in range(group.size())]
-            work = dist.all_gather(out_tensors, tensor, group=group, async_op=True)
-            work.wait()
-
-            return work, sum(out_tensors)
-
-        self._test_work_wait(tensor, comm_fn=comm_fn)
-
-    def _test_allgather_into_tensor_work_wait(self, tensor):
-        def comm_fn(tensor, group=None):
-            out_tensors = [torch.zeros_like(tensor) for _ in range(group.size())]
-            output_tensor = torch.cat(out_tensors, dim=0)
-            work = dist.all_gather_into_tensor(
-                output_tensor, tensor, group=group, async_op=True
-            )
-            work.wait()
-
-            return work, output_tensor
-
-        self._test_work_wait(tensor, comm_fn=comm_fn)
-
-    def _test_reduce_scatter_work_wait(self, tensor):
-        def comm_fn(tensor, group=None):
-            in_tensors = [tensor.clone() + i for i in range(group.size())]
-            out_tensor = torch.zeros_like(tensor)
-            work = dist.reduce_scatter(
-                out_tensor, in_tensors, group=group, async_op=True
-            )
-            return work, out_tensor
-
-        self._test_work_wait(tensor, comm_fn=comm_fn)
-
-    def _test_reduce_scatter_tensor_work_wait(self, tensor):
-        def comm_fn(tensor, group=None):
-            out_tensor = torch.zeros_like(tensor).chunk(group.size(), dim=0)[self.rank]
-            work = dist.reduce_scatter_tensor(
-                out_tensor, tensor, group=group, async_op=True
-            )
-            return work, out_tensor
-
-        self._test_work_wait(tensor, comm_fn=comm_fn)
-
-    def _test_broadcast_work_wait(self, tensor):
-        def comm_fn(tensor, group=None):
-            work = dist.broadcast(tensor, src=0, group=group, async_op=True)
-            return work, tensor
-
-        self._test_work_wait(tensor, comm_fn=comm_fn)
-
-    def _test_scatter_work_wait(self, tensor):
-        def comm_fn(tensor, group=None):
-            in_tensors = (
-                [tensor + i for i in range(group.size())] if self.rank == 0 else None
-            )
-            out_tensor = torch.zeros_like(tensor)
-            work = dist.scatter(
-                out_tensor, in_tensors, src=0, group=group, async_op=True
-            )
-            return work, out_tensor
-
-        self._test_work_wait(tensor, comm_fn=comm_fn)
-
-    def _test_alltoall_work_wait(self, tensor):
-        def comm_fn(tensor, group=None):
-            out_tensors = [torch.zeros_like(tensor) for _ in range(group.size())]
-            in_tensors = [tensor for i in range(group.size())]
-            work = dist.all_to_all(out_tensors, in_tensors, group=group, async_op=True)
-            return work, out_tensors
-
-        self._test_work_wait(tensor, comm_fn=comm_fn)
-
-    def _test_nested_comm_tensor_wrapping(self, tensor):
-        def comm_fn(tensor, group=None):
-            work = dist.all_reduce(CommTensor(tensor), group=group, async_op=True)
-            return work, tensor
-
-        self._test_work_wait(tensor, comm_fn=comm_fn)
-
-    def _test_consecutive_comm_work_wait(self, tensor):
-        def comm_fn(tensor, group=None):
-            work1 = dist.all_reduce(tensor, group=group, async_op=True)
-            work1.wait()
-            work2 = dist.all_reduce(tensor, group=group, async_op=True)
-            return work2, tensor
-
-        self._test_work_wait(tensor, comm_fn=comm_fn)
+        input_tensor = input_tensor.t()
+        with self.assertRaisesRegex(ValueError, "Tensors must be contiguous"):
+            dist.all_to_all_single(output_tensor, input_tensor)
 
 
 class ReduceOpTest(TestCase):
@@ -2227,8 +2267,9 @@ class LocalRankTest(MultiProcessTestCase):
 
 
 if __name__ == "__main__":
-    assert (
-        not torch.cuda._initialized
-    ), "test_distributed must not have initialized CUDA context on main process"
+    if device_type != "cpu":
+        assert not torch.get_device_module()._initialized, (
+            f"test_distributed must not have initialized {device_type} context on main process"
+        )
 
     run_tests()

@@ -7,14 +7,14 @@
 #include <c10/core/QScheme.h>
 #include <ATen/native/TensorAdvancedIndexing.h>
 
-namespace at {
-namespace native {
+
+namespace at::native {
 DEFINE_DISPATCH(masked_fill_kernel_quantized_stub);
 DEFINE_DISPATCH(index_put_kernel_quantized_stub);
 DEFINE_DISPATCH(index_put_with_sort_quantized_stub);
 
 namespace {
-static TensorIterator make_index_put_iterator(const AdvancedIndex& info, const Tensor& value) {
+TensorIterator make_index_put_iterator(const AdvancedIndex& info, const Tensor& value) {
   TORCH_CHECK(is_expandable_to(value.sizes(), info.src.sizes()), "shape mismatch: value tensor of shape ", value.sizes(),
              " cannot be broadcast to indexing result of shape ", info.src.sizes());
   TensorIteratorConfig config;
@@ -30,7 +30,7 @@ static TensorIterator make_index_put_iterator(const AdvancedIndex& info, const T
   return config.build();
 }
 
-static Tensor & masked_fill_impl_quantized_cpu(Tensor & self, const Tensor & mask, const Scalar& value) {
+Tensor & masked_fill_impl_quantized_cpu(Tensor & self, const Tensor & mask, const Scalar& value) {
   NoNamesGuard guard;
   TORCH_CHECK(mask.dtype() == ScalarType::Bool, "masked_fill only supports boolean masks, "
     "but got dtype ", mask.dtype());
@@ -144,7 +144,6 @@ Tensor& _index_put_impl_quantized_cpu_(Tensor & self, const torch::List<std::opt
     value_ = value.to(self.device());
   }
   at::assert_no_overlap(self, value);
-  // NOLINTNEXTLINE(performance-implicit-conversion-in-loop)
   for (const std::optional<Tensor>& index: indices) {
     if (index.has_value()) {
       at::assert_no_overlap(self, *index);
@@ -201,5 +200,4 @@ Tensor& _index_put_impl_quantized_cuda_(Tensor & self, const torch::List<std::op
   return self;
 }
 
-}
 }

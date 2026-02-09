@@ -7,15 +7,14 @@
 #include <ATen/native/cuda/Resize.h>
 #endif
 
-namespace torch {
-namespace inductor {
+namespace torch::inductor {
 using namespace at;
 
+// NOLINTNEXTLINE(performance-unnecessary-value-param)
 static void resize_storage_bytes_(const Tensor& variable, SymInt new_size) {
   // similar to THPStorage_resize_ in StorageMethods.cpp, but is traceable
   if (variable.storage().device_type() == at::kCUDA) {
-    // rocm build has undefined reference to resize_bytes_cuda
-#if defined(USE_CUDA) && !defined(USE_ROCM)
+#if defined(USE_CUDA)
     at::native::resize_bytes_cuda(
         variable.storage().unsafeGetStorageImpl(), new_size.expect_int());
 #else
@@ -28,6 +27,7 @@ static void resize_storage_bytes_(const Tensor& variable, SymInt new_size) {
 
 static void resize_storage_bytes__functionalize(
     const Tensor& variable,
+    // NOLINTNEXTLINE(performance-unnecessary-value-param)
     SymInt new_size) {
   static auto op = c10::Dispatcher::singleton()
                        .findSchemaOrThrow("inductor::resize_storage_bytes_", "")
@@ -61,5 +61,4 @@ TORCH_LIBRARY_IMPL(inductor, Functionalize, m) {
       "resize_storage_bytes_", TORCH_FN(resize_storage_bytes__functionalize));
 }
 
-} // namespace inductor
-} // namespace torch
+} // namespace torch::inductor

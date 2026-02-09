@@ -2,6 +2,7 @@
 #include <ATen/core/Tensor.h>
 #include <ATen/TensorUtils.h>
 #include <ATen/div_rtn.h>
+#include <c10/util/safe_numerics.h>
 
 namespace at::native {
 
@@ -54,9 +55,17 @@ inline void col2im_shape_check(
 
   int64_t batch_dim = (ndim == 3) ? 0 : -1;
   int64_t n_input_plane = input.size(batch_dim + 1);
+  uint64_t prod_kernel_size = 1;
+
+  TORCH_CHECK(!c10::mul_overflows(static_cast<uint64_t>(kernel_width), static_cast<uint64_t>(kernel_height), &prod_kernel_size),
+            "Given kernel_width = ",
+            kernel_width,
+            " and kernel_height = ",
+            kernel_height,
+            " the product of kernel_width and kernel_height overflowed.");
 
   if (n_input_plane % (kernel_width * kernel_height) != 0) {
-    AT_ERROR(
+    TORCH_CHECK(false,
         "Expected size of input's dimension 1 to be divisible by the "
         "product of kernel_size, but got input.size(1)=",
         n_input_plane,
@@ -81,7 +90,7 @@ inline void col2im_shape_check(
       1;
 
   if (input_length != (n_blocks_height * n_blocks_width)) {
-    AT_ERROR(
+    TORCH_CHECK(false,
         "Given output_size=(",
         output_height,
         ", ",
@@ -126,7 +135,7 @@ inline void col2im_shape_check(
     "which is too small (non-positive)");
 
   if (output_width < 1 || output_height < 1) {
-    AT_ERROR(
+    TORCH_CHECK(false,
         "Expected output spatial size to be positive, but got: output_size=(",
         output_height,
         ", ",
@@ -204,11 +213,11 @@ inline void im2col_shape_check(
       1;
 
   if (output_height < 1 || output_width < 1) {
-    AT_ERROR(
+    TORCH_CHECK(false,
         "Given input with spatial size (",
         input_height,
         ", ",
-        input_height,
+        input_width,
         "), kernel_size=(",
         kernel_height,
         ", ",

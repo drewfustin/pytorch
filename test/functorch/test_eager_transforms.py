@@ -1,5 +1,4 @@
 # Owner(s): ["module: functorch"]
-
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
 #
@@ -72,15 +71,15 @@ from torch.testing._internal.common_utils import (
     markDynamoStrictTest,
     parametrize,
     run_tests,
-    skipIfRocm,
     skipIfTorchDynamo,
     subtest,
+    TEST_CUDA_MEM_LEAK_CHECK,
     TEST_WITH_TORCHDYNAMO,
     TestCase,
     xfailIfTorchDynamo,
 )
-
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
+
 
 USE_TORCHVISION = False
 try:
@@ -313,6 +312,24 @@ class TestGradTransform(TestCase):
 
     def test_numel(self, device):
         self._test_attributes(lambda x: x.numel(), device)
+
+    def test_layout_sparse(self, device):
+        indices = torch.tensor([[0, 1, 1], [2, 0, 2]], device=device)
+        values = torch.tensor([3.0, 4.0, 5.0], device=device)
+        sparse_x = torch.sparse_coo_tensor(indices, values, (2, 3), device=device)
+
+        # Verify the input is sparse
+        self.assertEqual(sparse_x.layout, torch.sparse_coo)
+
+        def foo(x):
+            # assert GradTrackingTensor still reports sparse layout
+            self.assertEqual(x.layout, torch.sparse_coo)
+            return x.coalesce()._values().sum()
+
+        result = grad(foo)(sparse_x)
+
+        # The gradient should also be sparse
+        self.assertEqual(result.layout, torch.sparse_coo)
 
     def test_inplace(self, device):
         x = torch.randn([], device=device)
@@ -687,7 +704,7 @@ class TestGradTransform(TestCase):
         expected = (torch.zeros_like(x), torch.ones_like(x))
         self.assertEqual(result, expected)
 
-    # TODO: https://github.com/zou3519/functorch/issues/12
+    # TODO: https://github.com/pytorch/functorch/issues/12
     @onlyCPU
     def test_unrelated_hessian(self, device):
         N = 5
@@ -961,23 +978,21 @@ class TestGradTransform(TestCase):
                 fn = foo
                 bdim = 0
                 for op in reversed(op_list):
-                    if op == vmap:
+                    if op is vmap:
                         fn = op(fn, in_dims=bdim)
                         bdim += 1
                     else:
                         fn = op(fn)
 
                 expected = f"{repr(x)}"
-                level = 0
-                for op in op_list:
-                    level += 1
-                    if op == grad:
-                        expected = f"GradTrackingTensor(lvl={level}, value={expected})"
-                    elif op == vmap:
-                        bdim -= 1
+                for level, op in enumerate(op_list):
+                    if op is grad:
                         expected = (
-                            f"BatchedTensor(lvl={level}, bdim={bdim}, value={expected})"
+                            f"GradTrackingTensor(lvl={level + 1}, value={expected})"
                         )
+                    elif op is vmap:
+                        bdim -= 1
+                        expected = f"BatchedTensor(lvl={level + 1}, bdim={bdim}, value={expected})"
 
                 fn(x)
                 buf = buf.replace("\n", "").replace("  ", "")
@@ -1302,8 +1317,6 @@ class TestAutogradFunction(TestCase):
     # https://github.com/pytorch/pytorch/issues/90224
     @unittest.expectedFailure
     def test_once_differentiable_grad_vjp(self, device):
-        NumpyCubeNotComposable = self._get_NumpyCubeNotComposable()
-
         # grad x vjp
         x = torch.randn([], device=device)
         grad_y = torch.randn_like(x)
@@ -1554,7 +1567,7 @@ class TestAutogradFunctionVmapAPI(TestCase):
         B = 2
         x = torch.randn(B, 3)
         with self.assertRaisesRegex(RuntimeError, "to have two returns"):
-            result = vmap(Zeros.apply)(x)
+            vmap(Zeros.apply)(x)
 
         class TwoZeros(torch.autograd.Function):
             @staticmethod
@@ -1574,7 +1587,7 @@ class TestAutogradFunctionVmapAPI(TestCase):
         B = 2
         x = torch.randn(B, 3)
         with self.assertRaisesRegex(RuntimeError, "to have two returns"):
-            result = vmap(Zeros.apply)(x)
+            vmap(Zeros.apply)(x)
 
     def test_incompatible_out_dims_error_msg(self, device):
         class Zeros(torch.autograd.Function):
@@ -1595,7 +1608,7 @@ class TestAutogradFunctionVmapAPI(TestCase):
         B = 2
         x = torch.randn(B, 3)
         with self.assertRaisesRegex(RuntimeError, "returned an incompatible"):
-            result = vmap(Zeros.apply)(x)
+            vmap(Zeros.apply)(x)
 
         class Zeros(torch.autograd.Function):
             @staticmethod
@@ -1615,7 +1628,29 @@ class TestAutogradFunctionVmapAPI(TestCase):
         B = 2
         x = torch.randn(B, 3)
         with self.assertRaisesRegex(RuntimeError, "returned an incompatible"):
-            result = vmap(Zeros.apply)(x)
+            vmap(Zeros.apply)(x)
+
+    def test_kwarg_only_tensors(self, device):
+        with self.assertRaisesRegex(NotImplementedError, "kwarg-only Tensor args"):
+
+            class MyClass(torch.autograd.Function):
+                @staticmethod
+                def forward(x, *, y):
+                    return x + y
+
+                @staticmethod
+                def setup_context(ctx, inputs, output):
+                    pass
+
+                @staticmethod
+                def vmap(info, in_dims, x, *, y):
+                    assert in_dims == (0,)
+                    return x + y, 0
+
+            x = torch.randn(3)
+            y = torch.randn(3)
+
+            vmap(MyClass.apply)(x, y=y)
 
 
 @markDynamoStrictTest
@@ -2615,6 +2650,17 @@ class TestJvp(TestCase):
         self.assertTrue(isinstance(result, tuple))
         self.assertEqual(result, expected)
 
+    def test_jvp_new_tensor(self):
+        def f(x):
+            y = x.new_tensor(0.5)
+            return x + y
+
+        x = torch.rand(10, 10)
+        tangents = torch.zeros_like(x)
+        actual = jvp(f, (x,), (tangents,))
+        expected = (f(x), torch.zeros_like(x))
+        self.assertEqual(actual, expected)
+
     def test_primals_tangents_length_mismatch(self, device):
         x = torch.randn(2, 3, device=device)
         t = torch.randn(2, 3, device=device)
@@ -2835,6 +2881,10 @@ class TestLinearize(TestCase):
         self.assertEqual(actual_jvp, expected_jvp)
 
     @dtypes(torch.float)
+    @unittest.skipIf(
+        TEST_CUDA_MEM_LEAK_CHECK,
+        "Leaking memory, see https://github.com/pytorch/pytorch/pull/150059 for example",
+    )
     def test_linearize_return(self, device, dtype):
         x_p = make_tensor((3, 1), device=device, dtype=dtype)
         x_t = make_tensor((3, 1), device=device, dtype=dtype)
@@ -2849,7 +2899,11 @@ class TestLinearize(TestCase):
         self.assertEqual(actual_jvp, expected_jvp)
 
     @dtypes(torch.float)
-    def test_linearize_composition(self, device, dtype):
+    @unittest.skipIf(
+        TEST_CUDA_MEM_LEAK_CHECK,
+        "Leaking memory, see https://github.com/pytorch/pytorch/pull/150059 for example",
+    )
+    def test_linearize_composition_vmap(self, device, dtype):
         x_p = make_tensor((3, 1), device=device, dtype=dtype)
         x_t = make_tensor((3, 3, 1), device=device, dtype=dtype)
 
@@ -2867,6 +2921,33 @@ class TestLinearize(TestCase):
         self.assertEqual(actual_batched_jvp, expected_batched_jvp)
 
     @dtypes(torch.float)
+    @unittest.skipIf(
+        TEST_CUDA_MEM_LEAK_CHECK,
+        "Leaking memory, see https://github.com/pytorch/pytorch/pull/150059 for example",
+    )
+    def test_linearize_composition_grad(self, device, dtype):
+        x_p = make_tensor((3,), device=device, dtype=dtype)
+        x_t = make_tensor((3,), device=device, dtype=dtype)
+
+        def fn(x):
+            z = torch.ones(3, device=device, dtype=dtype)
+            return grad(lambda x: z @ x)(x)
+
+        _, jvp_fn = linearize(fn, x_p)
+        actual_batched_jvp = jvp_fn(x_t)
+
+        def jvp_fn(x_t):
+            return jvp(fn, (x_p,), (x_t,))[1]
+
+        expected_batched_jvp = jvp_fn(x_t)
+
+        self.assertEqual(actual_batched_jvp, expected_batched_jvp)
+
+    @dtypes(torch.float)
+    @unittest.skipIf(
+        TEST_CUDA_MEM_LEAK_CHECK,
+        "Leaking memory, see https://github.com/pytorch/pytorch/pull/150059 for example",
+    )
     def test_linearize_nested_input_nested_output(self, device, dtype):
         x_p = make_tensor((3, 1), device=device, dtype=dtype)
         x_t = make_tensor((3, 1), device=device, dtype=dtype)
@@ -3102,7 +3183,7 @@ class TestHelpers(TestCase):
 
             @staticmethod
             def backward(ctx, gy):
-                wrapped = torch._functorch.autograd_function.CtxWithSavedTensors(
+                wrapped = torch._functorch.autograd_function.CtxWithSavedTensors(  # noqa: F841
                     ctx, (y,)
                 )
                 return gy
@@ -3116,7 +3197,7 @@ class TestHelpers(TestCase):
 
             @staticmethod
             def backward(ctx, gy):
-                wrapped = torch._functorch.autograd_function.CtxWithSavedTensors(
+                wrapped = torch._functorch.autograd_function.CtxWithSavedTensors(  # noqa: F841
                     ctx, (y,)
                 )
                 return gy
@@ -3212,6 +3293,18 @@ class TestHelpers(TestCase):
         out = A.apply(x, y)
         out.backward()
 
+    def test_debug_unwrap(self):
+        stuff = []
+
+        def f(x):
+            stuff.append(torch.func.debug_unwrap(x))
+            return x.sin()
+
+        x = torch.randn(2, 3)
+        _ = vmap(vmap(f))(x)
+        self.assertEqual(stuff[0], x)
+        self.assertTrue(stuff[0] is x)
+
     def test_reductify_leaf(self, device):
         reductify_leaf = torch._functorch.autograd_function.reductify_leaf
         B = 2
@@ -3255,8 +3348,6 @@ class TestHelpers(TestCase):
 @markDynamoStrictTest
 class TestComposability(TestCase):
     def test_deprecation_vmap(self, device):
-        x = torch.randn(3, device=device)
-
         # functorch version of the API is deprecated
         with self.assertWarnsRegex(FutureWarning, "Please use `torch.vmap`"):
             vmap(torch.sin)
@@ -3397,12 +3488,14 @@ class TestComposability(TestCase):
         new_cotangent = torch.randn(())
         self.assertEqual(fx_f(new_cotangent, True, True), vjp_fn(new_cotangent))
 
+    # FIXME: test fails in Windows
+    @unittest.skipIf(IS_WINDOWS, "fails in Windows; needs investigation")
     @unittest.skipIf(IS_FBCODE, "can't subprocess in fbcode")
     # it is redundant to run this test twice on a machine that has GPUs
     @onlyCPU
     def test_no_warning_on_import_functorch(self, device):
         out = subprocess.check_output(
-            [sys.executable, "-W", "all", "-c", "import functorch"],
+            [sys.executable, "-W", "always", "-c", "import functorch"],
             stderr=subprocess.STDOUT,
             cwd=os.path.dirname(os.path.realpath(__file__)),
         ).decode("utf-8")
@@ -3527,13 +3620,10 @@ class TestComposability(TestCase):
     @parametrize(
         "transform",
         [
-            "vmap",
             "grad",
             "jacrev",
-            "jacfwd",
             "grad_and_value",
             "hessian",
-            "functionalize",
         ],
     )
     def test_transforms_dont_support_saved_tensor_hooks(self, device, transform):
@@ -3573,7 +3663,7 @@ class TestComposability(TestCase):
         with self.assertRaisesRegex(RuntimeError, "saved tensor hooks"):
             vjp(g, x)
 
-    def test_jvp_doesnt_support_saved_tensor_hooks(self, device):
+    def test_jvp_supports_saved_tensor_hooks(self, device):
         def f(x):
             return torch.sin(x).sum()
 
@@ -3584,12 +3674,12 @@ class TestComposability(TestCase):
         x = torch.randn(3, device=device)
         t = torch.randn(3, device=device)
 
-        with self.assertRaisesRegex(RuntimeError, "saved tensor hooks"):
-            with torch.autograd.graph.save_on_cpu():
-                jvp(f, (x,), (t,))
+        # smoke tests
+        with torch.autograd.graph.save_on_cpu():
+            jvp(f, (x,), (t,))
 
-        with self.assertRaisesRegex(RuntimeError, "saved tensor hooks"):
-            jvp(g, (x,), (t,))
+        # smoke tests
+        jvp(g, (x,), (t,))
 
     def test_can_use_functionalize_when_key_is_excluded(self, device):
         def f(x):
@@ -3640,7 +3730,7 @@ class TestMakeFunctional(TestCase):
     @parametrize("disable_autograd_tracking", [True, False])
     def test_disable_autograd_tracking(self, disable_autograd_tracking):
         class Foo(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.linear = nn.Linear(3, 3)
 
@@ -3658,7 +3748,7 @@ class TestMakeFunctional(TestCase):
 
     def test_parameter_tying(self):
         class Foo(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.bias = nn.Parameter(torch.randn(3))
                 self.linear = nn.Linear(3, 3)
@@ -3687,12 +3777,12 @@ class TestMakeFunctional(TestCase):
 
     def test_buffer_tying(self):
         class Foo(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.bias = nn.Parameter(torch.randn(3))
                 self.linear = nn.Linear(3, 3)
-                self.register_buffer("buffer", torch.randn(3))
-                self.register_buffer("buffer_tied", self.buffer)
+                self.buffer = nn.Buffer(torch.randn(3))
+                self.buffer_tied = self.buffer
 
             def forward(self, x):
                 x = self.linear(x)
@@ -3719,10 +3809,10 @@ class TestMakeFunctional(TestCase):
     @parametrize("disable_autograd_tracking", [True, False])
     def test_with_buffers_disable_autograd_tracking(self, disable_autograd_tracking):
         class Foo(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.linear = nn.Linear(3, 3)
-                self.register_buffer("buffer", torch.randn(3))
+                self.buffer = nn.Buffer(torch.randn(3))
 
             def forward(self, x):
                 x = self.linear(x)
@@ -3741,10 +3831,10 @@ class TestMakeFunctional(TestCase):
     @parametrize("detach_params", [True, False])
     def test_using_detach_functional_call(self, detach_params):
         class Foo(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.linear = nn.Linear(3, 3)
-                self.register_buffer("buffer", torch.randn(3))
+                self.buffer = nn.Buffer(torch.randn(3))
 
             def forward(self, x):
                 x = self.linear(x)
@@ -3767,7 +3857,7 @@ class TestMakeFunctional(TestCase):
 
     def test_parameter_tying_grad(self):
         class Foo(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.linear = nn.Linear(3, 3)
                 self.weight = self.linear.weight
@@ -3799,13 +3889,13 @@ class TestMakeFunctional(TestCase):
 
     def test_parameter_tying_ensemble(self):
         class Foo(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.linear = nn.Linear(3, 3)
                 self.weight = self.linear.weight
                 self.bias = self.linear.bias
-                self.register_buffer("buffer", torch.randn(3))
-                self.register_buffer("buffer_tied", self.buffer)
+                self.buffer = nn.Buffer(torch.randn(3))
+                self.buffer_tied = self.buffer
 
             def forward(self, x):
                 x = self.linear(x)
@@ -3833,7 +3923,7 @@ class TestMakeFunctional(TestCase):
     @parametrize("mechanism", ["make_functional", "functional_call"])
     def test_correctness_mnist(self, mechanism):
         class Net(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.conv1 = nn.Conv2d(1, 10, kernel_size=5)
                 self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
@@ -3944,7 +4034,7 @@ class TestMakeFunctional(TestCase):
     @parametrize("mechanism", ["make_functional", "functional_call"])
     def test_make_functional_state_correctly_returned_after_forward(self, mechanism):
         class Net(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.linear = nn.Linear(3, 3)
 
@@ -4000,7 +4090,7 @@ class TestExamplesCorrectness(TestCase):
     @parametrize("mechanism", ["make_functional", "functional_call"])
     def test_maml_regression(self, device, mechanism):
         class ThreeLayerNet(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.fc1 = nn.Linear(1, 40)
                 self.relu1 = nn.ReLU()
@@ -4249,9 +4339,7 @@ class TestExamplesCorrectness(TestCase):
 
         def lennard_jones_force(r):
             """Get magnitude of LJ force"""
-            return -epsilon * (
-                (-12 * sigma**12 / r**13) + (6 * sigma**6 / r**7)
-            )
+            return -epsilon * ((-12 * sigma**12 / r**13) + (6 * sigma**6 / r**7))
 
         r = torch.linspace(0.5, 2 * sigma, steps=100, requires_grad=True, device=device)
         drs = torch.outer(r, torch.tensor([1.0, 0, 0], device=device))
@@ -4420,8 +4508,9 @@ class TestExamplesCorrectness(TestCase):
         # This example mimics what a user might do when trying to find the optimal learning rate. They would
         # want to run a bunch of models with the same behavior (including the same dropout!) and have them
         # each run with different learning rates. Specifically, this is an example of using same randomness with vmap
-        points, labels = torch.randn(100, 2, 2, 2, 2, device=device), torch.randint(
-            0, 2, (100,), device=device
+        points, labels = (
+            torch.randn(100, 2, 2, 2, 2, device=device),
+            torch.randint(0, 2, (100,), device=device),
         )
 
         class MLPClassifier(nn.Module):
@@ -4495,7 +4584,7 @@ class TestExamplesCorrectness(TestCase):
     @unittest.skipIf(not USE_TORCHVISION, "test requires torchvision")
     @parametrize("mechanism", ["make_functional", "functional_call"])
     def test_resnet18_per_sample_grads(self, device, mechanism):
-        import torchvision.models as models
+        from torchvision import models
 
         model = models.__dict__["resnet18"](
             pretrained=False, norm_layer=(lambda c: nn.GroupNorm(min(32, c), c))
@@ -4707,9 +4796,9 @@ def forward(self, x_1, indices_1) -> torch.Tensor:
             y = x.detach()
             return y + y
 
-        with FakeTensorMode() as mode:
+        with FakeTensorMode():
             x = torch.ones(2, device=device, requires_grad=True)
-            out = functionalize(f)(x)
+            functionalize(f)(x)
         self.assertEqual(x.size(), (2,))
 
     def test_functionalize_fx_simple(self, device):
@@ -4735,8 +4824,8 @@ def forward(self, x_1) -> torch.Tensor:
     view_copy = torch.ops.aten.view_copy.default(x_1, [4, 2])
     add = torch.ops.aten.add.Tensor(view_copy, ones);  view_copy = ones = None
     view_copy_1 = torch.ops.aten.view_copy.default(add, [4, 2]);  add = None
-    view_copy_2 = torch.ops.aten.view_copy.default(view_copy_1, [4, 2])
-    copy_ = torch.ops.aten.copy_.default(x_1, view_copy_1);  x_1 = None
+    view_copy_2 = torch.ops.aten.view_copy.default(view_copy_1, [4, 2]);  view_copy_2 = None
+    copy_ = torch.ops.aten.copy_.default(x_1, view_copy_1);  x_1 = copy_ = None
     return view_copy_1
     """,
         )
@@ -4778,13 +4867,13 @@ def forward(self, x_1) -> torch.Tensor:
 
 
 def forward(self, inpt_1) -> torch.Tensor:
-    empty = torch.ops.aten.empty.memory_format([], dtype = torch.float32, device = 'cpu', pin_memory = False)
+    empty = torch.ops.aten.empty.memory_format([], dtype = torch.float32, device = 'cpu', pin_memory = False);  empty = None
     add = torch.ops.aten.add.Tensor(inpt_1, inpt_1);  inpt_1 = None
-    view_copy = torch.ops.aten.view_copy.default(add, [4])
+    view_copy = torch.ops.aten.view_copy.default(add, [4]);  view_copy = None
     view_copy_1 = torch.ops.aten.view_copy.default(add, [4]);  add = None
     add_1 = torch.ops.aten.add.Tensor(view_copy_1, 1);  view_copy_1 = None
     view_copy_2 = torch.ops.aten.view_copy.default(add_1, [4]);  add_1 = None
-    view_copy_3 = torch.ops.aten.view_copy.default(view_copy_2, [4])
+    view_copy_3 = torch.ops.aten.view_copy.default(view_copy_2, [4]);  view_copy_3 = None
     return view_copy_2
     """,
         )
@@ -4808,15 +4897,15 @@ def forward(self, inpt_1) -> torch.Tensor:
 
 
 def forward(self, inpt_1) -> torch.Tensor:
-    empty = torch.ops.aten.empty.memory_format([4], dtype = torch.float32, device = 'cpu', pin_memory = False)
+    empty = torch.ops.aten.empty.memory_format([4], dtype = torch.float32, device = 'cpu', pin_memory = False);  empty = None
     empty_1 = torch.ops.aten.empty.memory_format([2, 2], dtype = torch.float32, device = 'cpu', pin_memory = False)
-    view_copy = torch.ops.aten.view_copy.default(empty_1, [4]);  empty_1 = None
+    view_copy = torch.ops.aten.view_copy.default(empty_1, [4]);  empty_1 = view_copy = None
     view_copy_1 = torch.ops.aten.view_copy.default(inpt_1, [2, 4]);  inpt_1 = None
     aminmax = torch.ops.aten.aminmax.default(view_copy_1, dim = 0);  view_copy_1 = None
     getitem = aminmax[0]
     getitem_1 = aminmax[1];  aminmax = None
     view_copy_2 = torch.ops.aten.view_copy.default(getitem_1, [2, 2]);  getitem_1 = None
-    view_copy_3 = torch.ops.aten.view_copy.default(view_copy_2, [4])
+    view_copy_3 = torch.ops.aten.view_copy.default(view_copy_2, [4]);  view_copy_3 = None
     return (view_copy_2, getitem)
     """,
         )
@@ -4841,8 +4930,8 @@ def forward(self, x_1) -> torch.Tensor:
     view = torch.ops.aten.view.default(x_1, [4, 2])
     add = torch.ops.aten.add.Tensor(view, ones);  view = ones = None
     view_1 = torch.ops.aten.view.default(add, [4, 2]);  add = None
-    view_2 = torch.ops.aten.view.default(view_1, [4, 2])
-    copy_ = torch.ops.aten.copy_.default(x_1, view_1);  x_1 = None
+    view_2 = torch.ops.aten.view.default(view_1, [4, 2]);  view_2 = None
+    copy_ = torch.ops.aten.copy_.default(x_1, view_1);  x_1 = copy_ = None
     return view_1
     """,
         )
@@ -4931,14 +5020,21 @@ def forward(self, x_1):
     resize = torch.ops.aten.resize.default(x_1, [10])
     fill = torch.ops.aten.fill.Scalar(resize, 2);  resize = None
     resize_ = torch.ops.aten.resize_.default(x_1, [10]);  x_1 = None
-    copy_ = torch.ops.aten.copy_.default(resize_, fill);  resize_ = fill = None
+    copy_ = torch.ops.aten.copy_.default(resize_, fill);  resize_ = fill = copy_ = None
     return None
     """,
         )
 
 
 def construct_sum_pyop():
-    mysum = HigherOrderOperator("mysum")
+    class MySum(HigherOrderOperator):
+        def __init__(self):
+            super().__init__("mysum")
+
+        def __call__(self, *args, **kwargs):
+            return super().__call__(*args, **kwargs)
+
+    mysum = MySum()
 
     @mysum.py_impl(torch._C._functorch.TransformType.Vmap)
     def mysum_batch_rule(interpreter, x, dim):
@@ -5082,10 +5178,13 @@ def traceable(f):
 
 @markDynamoStrictTest
 class TestCompileTransforms(TestCase):
-    @skipIfRocm(msg="test leaks memory on ROCm")
-    # torch.compile is not supported on Windows
+    # torch.compile is not supported on Windows CUDA.
     # Triton only supports GPU with SM70 or later.
-    @expectedFailureIf(IS_WINDOWS or (TEST_CUDA and not SM70OrLater))
+    @expectedFailureIf((IS_WINDOWS and TEST_CUDA) or (TEST_CUDA and not SM70OrLater))
+    @unittest.skipIf(
+        TEST_CUDA_MEM_LEAK_CHECK,
+        "Leaking memory, see https://github.com/pytorch/pytorch/pull/150059 for example",
+    )
     def test_compile_vmap_hessian(self, device):
         # The model and inputs are a smaller version
         # of code at benchmark repo:
@@ -5118,7 +5217,6 @@ class TestCompileTransforms(TestCase):
         self.assertEqual(actual, expected)
 
     # torch.compile is not supported on Windows
-    @expectedFailureIf(IS_WINDOWS)
     @torch._dynamo.config.patch(suppress_errors=False)
     def test_grad_deprecated_api(self, device):
         x = torch.randn((), device=device)
@@ -5129,7 +5227,7 @@ class TestCompileTransforms(TestCase):
 
         actual = wrapper_fn(x, y)
         expected = torch.compile(wrapper_fn, backend="eager", fullgraph=True)(x, y)
-        fn = torch.compile(wrapper_fn, backend="eager", fullgraph=True)
+        torch.compile(wrapper_fn, backend="eager", fullgraph=True)
         self.assertEqual(actual, expected)
 
         def wrapper_fn(x, y):
@@ -5138,6 +5236,101 @@ class TestCompileTransforms(TestCase):
         actual = wrapper_fn(x, y)
         expected = torch.compile(wrapper_fn, backend="eager", fullgraph=True)(x, y)
         self.assertEqual(actual, expected)
+
+
+class TestGradTrackingTensorToList(TestCase):
+    """Tests for tolist() method with GradTrackingTensor (functorch tensors)."""
+
+    def test_tolist_with_grad(self):
+        """Test to see if tolist works inside grad transformation."""
+
+        def f(x):
+            # inside grad, x is a GradTrackingTensor
+            result = x.tolist()
+            # tolist should return a python list and not fail
+            self.assertIsInstance(result, list)
+            self.assertEqual(result, [1.0, 2.0, 3.0])
+            return (x**2).sum()
+
+        x = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+        grad_f = torch.func.grad(f)
+        result = grad_f(x)
+        self.assertIsInstance(result, torch.Tensor)
+        # gradients should still be computed correctly
+        self.assertEqual(result, [2.0, 4.0, 6.0])
+
+    def test_tolist_nested_grad(self):
+        """Test `tolist` with nested grad transformations."""
+
+        def f(x):
+            def g(y):
+                # y is gradTrackingTensor(lvl=1)
+                inner_list = y.tolist()
+                self.assertIsInstance(inner_list, list)
+                return (y**2).sum()
+
+            # x is a gradTrackingTensor(lvl=0)
+            outer_list = x.tolist()
+            self.assertIsInstance(outer_list, list)
+            grad_g = torch.func.grad(g)
+            return grad_g(x).sum()
+
+        x = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+        grad_f = torch.func.grad(f)
+        result = grad_f(x)
+        # should compute second derivate
+        self.assertIsInstance(result, torch.Tensor)
+        # grad_f should return the derivate of g(y) which is (2*x).sum
+        self.assertEqual(
+            result,
+            [
+                2.0,
+                2.0,
+                2.0,
+            ],
+        )
+
+    def test_tolist_multidimensional_grad(self):
+        """Test tolist with multi-dimensional tensors in grad."""
+
+        def f(x):
+            result = x.tolist()
+            self.assertIsInstance(result, list)
+            self.assertEqual(len(result), 2)
+            self.assertEqual(result, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+            return x.sum()
+
+        x = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], requires_grad=True)
+        grad_f = torch.func.grad(f)
+        result = grad_f(x)
+        self.assertIsInstance(result, torch.Tensor)
+        self.assertEqual(
+            result,
+            [
+                [
+                    1.0,
+                    1.0,
+                    1.0,
+                ],
+                [1.0, 1.0, 1.0],
+            ],
+        )
+
+    def test_tolist_conj_neg_grad(self):
+        """Test tolist method with conjugate/negative tensors in grad context."""
+
+        def f(x):
+            # test with the conjugate view
+            x_conj = x.conj()
+            result_conj = x_conj.tolist()
+            self.assertIsInstance(result_conj, list)
+            return (x * x.conj()).real.sum()
+
+        x = torch.tensor([1.0 + 2.0j, 3.0 + 4.0j], requires_grad=True)
+        grad_f = torch.func.grad(f)
+        result = grad_f(x)
+        self.assertIsInstance(result, torch.Tensor)
+        self.assertEqual(result, [2.0 + 4.0j, 6.0 + 8.0j])
 
 
 only_for = ("cpu", "cuda")
@@ -5218,6 +5411,9 @@ instantiate_device_type_tests(
     TestCompileTransforms,
     globals(),
     only_for=only_for,
+)
+instantiate_device_type_tests(
+    TestGradTrackingTensorToList, globals(), only_for=only_for
 )
 
 if __name__ == "__main__":

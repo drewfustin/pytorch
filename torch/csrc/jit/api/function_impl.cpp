@@ -3,7 +3,6 @@
 #include <torch/csrc/jit/api/function_impl.h>
 #include <torch/csrc/jit/passes/inliner.h>
 
-#include <torch/csrc/jit/frontend/error_report.h>
 #include <torch/csrc/jit/passes/constant_pooling.h>
 #include <torch/csrc/jit/passes/constant_propagation.h>
 #include <torch/csrc/jit/passes/peephole.h>
@@ -13,10 +12,11 @@
 #include <torch/csrc/jit/passes/autocast.h>
 #endif
 
+// clang-format off
 C10_DEFINE_bool(
     torch_jit_do_not_store_optimized_graph,
     false,
-    "Do not store the optimized graph.");
+    "Do not store the optimized graph.")
 
 namespace torch::jit {
 namespace {
@@ -61,11 +61,12 @@ T& toGraphFunctionImpl(F& function) {
 
 } // namespace
 
-static void placeholderCreator(GraphFunction&) {
+static void placeholderCreator(GraphFunction& /*unused*/) {
   throw RecursiveMethodCallError();
 }
 
 void GraphFunction::run(Stack& stack) {
+  C10_LOG_EVENT_SAMPLED(run, qualname().qualifiedName(), stack);
   get_executor().run(stack);
 }
 
@@ -132,8 +133,8 @@ GraphFunction::SpecializationKey GraphFunction::currentSpecialization() const {
 void preoptimizeGraph(std::shared_ptr<Graph>& graph, bool disable_autocast) {
   Inline(*graph);
 
-  // Peephole Optimize cleans up many "is None" checks and creates constant prop
-  // opportunities
+  // Peephole Optimize cleans up many "is None" checks and creates constant
+  // prop opportunities
   PeepholeOptimize(graph, true);
 
   // AliasDb construction can be slow, so run it just on immutable types

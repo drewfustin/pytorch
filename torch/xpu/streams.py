@@ -1,10 +1,9 @@
 # mypy: allow-untyped-defs
+# pylint: disable=useless-parent-delegation
 import ctypes
 
 import torch
-from torch._streambase import _EventBase, _StreamBase
-
-from .._utils import _dummy_type
+from torch._utils import _dummy_type
 
 
 if not hasattr(torch._C, "_XpuStreamBase"):
@@ -13,19 +12,23 @@ if not hasattr(torch._C, "_XpuStreamBase"):
     torch._C.__dict__["_XpuEventBase"] = _dummy_type("_XpuEventBase")
 
 
-class Stream(torch._C._XpuStreamBase, _StreamBase):
+class Stream(torch._C._XpuStreamBase):
     r"""Wrapper around a XPU stream.
 
     A XPU stream is a linear sequence of execution that belongs to a specific
-    device, independent from other streams.
+    device, independent from other streams. It supports with statement as a
+    context manager to ensure the operators within the with block are running
+    on the corresponding stream.
 
     Args:
         device(torch.device or int, optional): a device on which to allocate
             the stream. If :attr:`device` is ``None`` (default) or a negative
             integer, this will use the current device.
-        priority(int, optional): priority of the stream, should be 0 or
-            negative, where negative numbers indicate higher priority. By default,
-            streams have priority 0.
+        priority(int, optional): priority of the stream, which can be positive, 0, or negative.
+            A lower number indicates a higher priority. By default, the priority is set to 0.
+            If the value falls outside of the allowed priority range, it will automatically be
+            mapped to the nearest valid priority (lowest for large positive numbers or
+            highest for large negative numbers).
     """
 
     def __new__(cls, device=None, priority=0, **kwargs):
@@ -94,11 +97,11 @@ class Stream(torch._C._XpuStreamBase, _StreamBase):
     def __hash__(self):
         return hash((self.sycl_queue, self.device))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"torch.xpu.Stream(device={self.device} sycl_queue={self.sycl_queue:#x})"
 
 
-class Event(torch._C._XpuEventBase, _EventBase):
+class Event(torch._C._XpuEventBase):
     r"""Wrapper around a XPU event.
 
     XPU events are synchronization markers that can be used to monitor the
@@ -124,7 +127,7 @@ class Event(torch._C._XpuEventBase, _EventBase):
         """
         if stream is None:
             stream = torch.xpu.current_stream()
-        super().record(stream)
+        super().record(stream)  # pyrefly: ignore [bad-argument-type]
 
     def wait(self, stream=None) -> None:
         r"""Make all future work submitted to the given stream wait for this event.
@@ -164,7 +167,7 @@ class Event(torch._C._XpuEventBase, _EventBase):
     def _as_parameter_(self):
         return ctypes.c_void_p(self.sycl_event)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         if self.sycl_event:
             return f"torch.xpu.Event(sycl_event={self.sycl_event:#x})"
         else:

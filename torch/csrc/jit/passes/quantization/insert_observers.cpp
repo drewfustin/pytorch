@@ -4,8 +4,6 @@
 #include <torch/csrc/jit/frontend/schema_matching.h>
 #include <torch/csrc/jit/ir/subgraph_matcher.h>
 #include <torch/csrc/jit/jit_log.h>
-#include <torch/csrc/jit/passes/constant_pooling.h>
-#include <torch/csrc/jit/passes/constant_propagation.h>
 #include <torch/csrc/jit/passes/fuse_linear.h>
 #include <torch/csrc/jit/passes/graph_rewrite_helper.h>
 #include <torch/csrc/jit/passes/inline_fork_wait.h>
@@ -17,8 +15,7 @@
 #include <string>
 #include <utility>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 using ModuleQConfigMap = std::unordered_map<ModulePtr, std::optional<QConfig>>;
 
@@ -49,7 +46,7 @@ void fillQConfigMap(
     const QConfigDict& qconfig_dict,
     ModuleQConfigMap& map,
     const std::string& key = "",
-    const std::optional<QConfig>& parent_qconfig = c10::nullopt) {
+    const std::optional<QConfig>& parent_qconfig = std::nullopt) {
   std::optional<QConfig> qconfig;
   if (qconfig_dict.find(key) != qconfig_dict.end()) {
     GRAPH_DEBUG("Got module config for key:", key);
@@ -1120,8 +1117,7 @@ void InsertObserversHelper::fillBoundaryValueMap(
         // offset of input for the caller node, since the first
         // input of CallFunction is the function node and the graph
         // for CallFunction start with actual input
-        // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-        size_t input_offset;
+        size_t input_offset = 0;
         if (n->kind() == prim::CallMethod) {
           auto m_opt = getInvokedModuleOpt(module, n, self);
           if (!m_opt.has_value()) {
@@ -1414,7 +1410,7 @@ InsertObserversHelper::insertObserversFor(
       if (!isObserved(v, block_observed_values)) {
         block_output_observers.emplace_back(getObserverFor(v));
       } else {
-        block_output_observers.emplace_back(c10::nullopt);
+        block_output_observers.emplace_back(std::nullopt);
       }
     }
   }
@@ -1469,8 +1465,7 @@ InsertObserversHelper::insertObserversFor(
       if (n->kind() == prim::CallMethod || userDefinedCallFunction(n)) {
         script::Module m;
         std::shared_ptr<Graph> g;
-        // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-        size_t input_offset;
+        size_t input_offset = 0;
         bool is_udf_for_subblock = is_user_defined_function;
         if (n->kind() == prim::CallMethod) {
           auto m_opt = getInvokedModuleOpt(module, n, self);
@@ -1705,7 +1700,7 @@ Module InsertObserversForOnDevicePTQ(
   // you will have multiple getattrs for the same attribute and thus potentially
   // multiple observers observing the same value. This will also lead to
   // increased size of the packed param struct. I dont expect this to be a
-  // common pattern but something to be aware fo Note that current quant
+  // common pattern but something to be aware of Note that current quant
   // workflow does not prevent this anyway since during inset quant dequant
   // things are inlined anyway
   helper.fillBoundaryValueMap(cloned_module, observer_method_name);
@@ -1722,5 +1717,4 @@ Module InsertObserversForOnDevicePTQ(
       cloned_module, observer_method_name, /* is_entry_point */ true);
   return cloned_module;
 }
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

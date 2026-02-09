@@ -1,12 +1,12 @@
 #include <ATen/core/Dict.h>
-#include <ATen/core/Tensor.h>
 #include <ATen/core/dynamic_type.h>
 #include <ATen/core/enum_type.h>
 #include <ATen/core/function.h>
 #include <ATen/core/function_schema.h>
-#include <ATen/core/grad_mode.h>
 #include <ATen/core/jit_type.h>
 #include <c10/macros/Macros.h>
+#include <c10/util/env.h>
+#include <c10/util/Exception.h>
 #include <c10/util/flat_hash_map.h>
 #include <c10/util/irange.h>
 #include <array>
@@ -45,9 +45,9 @@ static_assert(
     "getTypePtr<std::tuple<int64_t, int64_t>> not returning const ref!");
 
 TypeVerbosity type_verbosity() {
-  static const char* c_verbosity = std::getenv("PYTORCH_JIT_TYPE_VERBOSITY");
+  static const auto c_verbosity = c10::utils::get_env("PYTORCH_JIT_TYPE_VERBOSITY");
   static TypeVerbosity verbosity = c_verbosity ?
-    static_cast<TypeVerbosity>(std::stoi(c_verbosity)) : TypeVerbosity::Default;
+    static_cast<TypeVerbosity>(std::stoi(c_verbosity.value())) : TypeVerbosity::Default;
   return verbosity;
 }
 
@@ -61,11 +61,11 @@ std::ostream& operator<<(std::ostream & out, const Type & t) {
     } else {
       out << "Tensor";
     }
-    if (auto ndim = value->sizes().size()) {
-      bool has_valid_strides_info = *ndim > 0 &&
+    if (auto ndim = value->sizes().size(); ndim.has_value()) {
+      bool has_valid_strides_info = ndim > 0 &&
           value->strides().isComplete() && value->strides().size() == ndim;
 
-      out << "(";
+      out << '(';
       size_t i = 0;
       bool symbolic = type_verbosity() == TypeVerbosity::Symbolic;
       for (i = 0; i < *ndim; ++i) {
@@ -77,7 +77,7 @@ std::ostream& operator<<(std::ostream & out, const Type & t) {
         } else if (symbolic) {
           out << value->symbolic_sizes().at(i);
         } else {
-          out << "*";
+          out << '*';
         }
       }
       if (has_valid_strides_info &&
@@ -87,9 +87,9 @@ std::ostream& operator<<(std::ostream & out, const Type & t) {
           if (i > 0) {
             out << ", ";
           }
-          out << *value->strides()[i];
+          out << value->strides()[i].value();
         }
-        out << "]";
+        out << ']';
       }
       if (type_verbosity() >= TypeVerbosity::Full) {
         if (value->requiresGrad()) {
@@ -105,12 +105,12 @@ std::ostream& operator<<(std::ostream & out, const Type & t) {
           out << "device=" << *value->device();
         }
       }
-      out << ")";
+      out << ')';
     } else {
       if (type_verbosity() >= TypeVerbosity::Full) {
         size_t i = 0;
         if (value->requiresGrad()) {
-          out << "("
+          out << '('
               << "requires_grad=" << *value->requiresGrad();
           i++;
         }
@@ -118,7 +118,7 @@ std::ostream& operator<<(std::ostream & out, const Type & t) {
           out << ((i++ > 0) ? ", " : "(") << "device=" << *value->device();
         }
         if (i > 0) {
-          out << ")";
+          out << ')';
         }
       }
     }
@@ -131,18 +131,18 @@ std::ostream& operator<<(std::ostream & out, const Type & t) {
     out << *prim << "[]";
   } else if (t.kind() == TypeKind::OptionalType) {
     auto prim = t.castRaw<OptionalType>()->getElementType();
-    out << *prim << "?";
+    out << *prim << '?';
   } else if(t.kind() == TypeKind::FutureType) {
     auto elem = t.castRaw<FutureType>()->getElementType();
-    out << "Future[" << *elem << "]";
+    out << "Future[" << *elem << ']';
   } else if(t.kind() == TypeKind::RRefType) {
     auto elem = t.castRaw<RRefType>()->getElementType();
-    out << "RRef[" << *elem << "]";
+    out << "RRef[" << *elem << ']';
   } else if(auto tup = t.cast<TupleType>()) {
     if (tup->schema()) {
       out << "NamedTuple";
     }
-    out << "(";
+    out << '(';
     for(size_t i = 0; i < tup->elements().size(); ++i) {
       if(i > 0)
         out << ", ";
@@ -158,7 +158,7 @@ std::ostream& operator<<(std::ostream & out, const Type & t) {
         out << *(tup->elements()[i]);
       }
     }
-    out << ")";
+    out << ')';
   } else if (t.kind() == TypeKind::FunctionType) {
     out << "Function";
   } else {
@@ -403,14 +403,14 @@ static std::optional<TypePtr> unifyTypesImpl(const TypePtr& t1, const TypePtr& t
     auto tuple1 = t1->castRaw<TupleType>();
     auto tuple2 = t2->castRaw<TupleType>();
     if (tuple1->elements().size() != tuple2->elements().size()) {
-      return c10::nullopt;
+      return std::nullopt;
     }
     std::vector<TypePtr> elements;
     for (size_t i = 0; i < tuple1->elements().size(); i++) {
       if (auto elem = unifyTypes(tuple1->elements().at(i), tuple2->elements().at(i), default_to_union)) {
         elements.push_back(*std::move(elem));
       } else {
-        return c10::nullopt;
+        return std::nullopt;
       }
     }
     return static_cast<TypePtr>(TupleType::create(std::move(elements)));
@@ -443,7 +443,7 @@ static std::optional<TypePtr> unifyTypesImpl(const TypePtr& t1, const TypePtr& t
     return type_hint;
   }
 
-  return c10::nullopt;
+  return std::nullopt;
 }
 
 std::optional<TypePtr> unifyTypes(const TypePtr& t1, const TypePtr& t2, bool default_to_union, const TypePtr& type_hint) {
@@ -463,7 +463,7 @@ std::optional<TypePtr> unifyTypeList(
     const TypePtr& type_hint) {
   if (elements.empty()) {
     why_not << "Cannot get unified type from empty list";
-    return c10::nullopt;
+    return std::nullopt;
   }
 
   TypePtr ret_type = elements.at(0);
@@ -473,8 +473,8 @@ std::optional<TypePtr> unifyTypeList(
       why_not << "Could not unify type list since element " << i << " of type "
               << elements.at(i)->repr_str()
               << " did not match the types before it ("
-              << ret_type->repr_str() << ")";
-      return c10::nullopt;
+              << ret_type->repr_str() << ')';
+      return std::nullopt;
     }
     ret_type = *maybe_unified;
   }
@@ -629,7 +629,7 @@ MatchTypeReturn matchTypeVariables(
     }
   }
 
-  AT_ERROR("Unhandled free variable container: ", formal->repr_str());
+  TORCH_CHECK(false, "Unhandled free variable container: ", formal->repr_str());
 }
 
 // change return types like List[List[t]] into List[List[int]]
@@ -678,7 +678,7 @@ TORCH_API bool elementTypeCanBeInferredFromMembers(const TypePtr& elem_type) {
     return false;
   }
   if (elem_type->kind() == AnyType::Kind) {
-    // List of Any can contains heterogenous types
+    // List of Any can contains heterogeneous types
     return false;
   }
   return true;
@@ -728,7 +728,7 @@ TupleTypePtr TupleType::createNamed(
 
 TupleTypePtr TupleType::createNamed(
     const std::optional<c10::QualifiedName>& qualName,
-    const std::vector<c10::string_view>& field_names,
+    const std::vector<std::string_view>& field_names,
     const std::vector<TypePtr>& field_types) {
   std::vector<IValue> empty_defaults;
   return createWithSpec(qualName, field_names, field_types, empty_defaults);
@@ -784,11 +784,11 @@ TupleTypePtr TupleType::createWithSpec(const std::optional<c10::QualifiedName>& 
       field_types, qualName, std::move(schema))); // NOLINT(modernize-make-shared)
 }
 
-std::optional<std::vector<c10::string_view>> TupleType::names() const {
+std::optional<std::vector<std::string_view>> TupleType::names() const {
   if (!schema_) {
     return {};
   }
-  std::vector<c10::string_view> ret;
+  std::vector<std::string_view> ret;
   for (const auto& arg : schema_->arguments()) {
     ret.emplace_back(arg.name());
   }
@@ -825,9 +825,7 @@ TupleType::TupleType(
     : NamedType(TypeKind::TupleType, std::move(name)),
       elements_(std::move(elements)),
       has_free_variables_(std::any_of(elements_.begin(), elements_.end(), [](const TypePtr& v) {
-        if (!v) {
-          throw std::runtime_error("Can not create tuple with None type");
-        }
+        TORCH_CHECK(v, "Can not create tuple with None type");
         return v->hasFreeVariables();
       })), schema_(std::move(schema)) {
 
@@ -903,16 +901,17 @@ bool ListType::isSubtypeOfExt(const Type& rhs_, std::ostream* why_not) const {
 
 std::string TupleType::str() const {
   std::stringstream ss;
-  if (schema_ && name()) {
+  if (schema_ && name().has_value()) {
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
     ss << name()->qualifiedName();
   } else {
-    ss << "(";
+    ss << '(';
     for(size_t i = 0; i < elements().size(); ++i) {
       if(i > 0)
         ss << ", ";
       ss << elements()[i]->str();
     }
-    ss << ")";
+    ss << ')';
   }
   return ss.str();
 }
@@ -997,14 +996,13 @@ bool InterfaceType::isSubTypeImpl(
         }
         return false;
       }
-      // NOLINTNEXTLINE(bugprone-argument-comment)
-      if (!self_schema->isSubtypeOf(schema, /*is_method=*/true, why_not)) {
+      if (!self_schema->isSubtypeOf(schema, /*as_method=*/true, why_not)) {
         if (why_not) {
           *why_not << "Method on interface '" << lhs.repr_str()
                    << "' (1) is not compatible with interface '"
                    << rhs.repr_str() << "' (2)\n"
-                   << "  (1) " << *self_schema << "\n"
-                   << "  (2) " << schema << "\n";
+                   << "  (1) " << *self_schema << '\n'
+                   << "  (2) " << schema << '\n';
           return false;
         }
         return false;
@@ -1036,8 +1034,6 @@ InterfaceType::InterfaceType(QualifiedName name, bool is_module)
     : NamedType(InterfaceType::Kind, std::move(name)),
       methods_(std::make_shared<std::vector<FunctionSchema>>()),
       is_module_(is_module) {}
-
-InterfaceType::~InterfaceType() = default;
 
 bool containsAnyType(const TypePtr& type) {
   std::vector<TypePtr> to_scan = { type };
@@ -1080,7 +1076,7 @@ SymbolicShape SymbolicShape::merge(const SymbolicShape& other) const {
 }
 
 void SymbolicShape::dump() const {
-  std::cout << *this << "\n";
+  std::cout << *this << '\n';
 }
 
 bool EnumType::isSubtypeOfExt(const Type& rhs, std::ostream* why_not) const {

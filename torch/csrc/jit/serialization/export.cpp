@@ -5,7 +5,6 @@
 #include <ATen/core/functional.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
-#include <c10/util/Optional.h>
 #include <c10/util/accumulate.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/autograd/symbolic.h>
@@ -17,20 +16,18 @@
 #include <torch/csrc/jit/serialization/import_export_functions.h>
 #include <torch/csrc/jit/serialization/import_export_helpers.h>
 #include <torch/csrc/jit/serialization/onnx.h>
+#include <torch/csrc/jit/serialization/pickler.h>
 #include <torch/csrc/onnx/back_compat.h>
 #include <torch/csrc/onnx/onnx.h>
 #include <torch/version.h>
 
-C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wnewline-eof")
 #include <onnx/checker.h>
-C10_DIAGNOSTIC_POP()
 #include <onnx/onnx_pb.h>
 #include <onnx/proto_utils.h>
-C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wsuggest-override")
 #include <onnx/shape_inference/implementation.h>
-C10_DIAGNOSTIC_POP()
 
 #include <memory>
+#include <optional>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -90,8 +87,8 @@ namespace {
 namespace onnx_torch = ::torch::onnx;
 namespace onnx = ::ONNX_NAMESPACE;
 
-const static int kInvalidOpsetVersion = -1;
-const static int kMainOpsetVersion = 20;
+constexpr int kInvalidOpsetVersion = -1;
+constexpr int kMainOpsetVersion = 23;
 // Based on OP_SET_ID_VERSION_MAP in
 // https://github.com/onnx/onnx/blob/master/onnx/helper.py.
 constexpr static std::array<int64_t, kMainOpsetVersion + 1>
@@ -117,6 +114,9 @@ constexpr static std::array<int64_t, kMainOpsetVersion + 1>
         8, // opset 18
         9, // opset 19
         9, // opset 20
+        10, // opset 21
+        10, // opset 22
+        11, // opset 23
 };
 
 std::string getNodeStackTraceString(const Node* n) {
@@ -418,7 +418,7 @@ class GraphEncoder {
   static constexpr size_t ParamSizeThresholdForExternalStorage = 1024;
 };
 
-onnx::TensorProto_DataType ATenTypeToOnnxType(at::ScalarType at_type) {
+static onnx::TensorProto_DataType ATenTypeToOnnxType(at::ScalarType at_type) {
   switch (at_type) {
     case at::kDouble:
       return onnx::TensorProto_DataType_DOUBLE;
@@ -463,7 +463,7 @@ onnx::TensorProto_DataType ATenTypeToOnnxType(at::ScalarType at_type) {
   }
 }
 
-onnx::AttributeProto_AttributeType ATenAttributeKindToOnnxAttributeType(
+static onnx::AttributeProto_AttributeType ATenAttributeKindToOnnxAttributeType(
     AttributeKind at_kind,
     const jit::Symbol name) {
   switch (at_kind) {
@@ -601,6 +601,7 @@ GraphEncoder::GraphEncoder(
   }
 }
 
+// NOLINTBEGIN(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
 void GraphEncoder::TensorTypeToONNXType(
     const TensorTypePtr& tensor_type,
     const std::string& dim_name_prefix,
@@ -637,6 +638,7 @@ void GraphEncoder::TensorTypeToONNXType(
         ATenTypeToOnnxType(tensor_type->scalarType().value()));
   }
 }
+// NOLINTEND(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
 
 void GraphEncoder::EncodeValueInfoType(
     onnx::TypeProto* onnx_type,
@@ -1078,12 +1080,11 @@ void GraphEncoder::AddAttribute(
       ATenAttributeKindToOnnxAttributeType(node->kindOf(name), name));
   switch (node->kindOf(name)) {
     case AttributeKind::f:
-      attr->set_f(node->f(name));
+      attr->set_f(static_cast<float>(node->f(name)));
       break;
     case AttributeKind::fs:
       for (auto& v : node->fs(name))
-        // NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
-        attr->add_floats(v);
+        attr->add_floats(static_cast<float>(v));
       break;
     case AttributeKind::i:
       attr->set_i(node->i(name));

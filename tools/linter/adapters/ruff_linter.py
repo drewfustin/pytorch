@@ -1,3 +1,9 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "ruff==0.14.4",
+# ]
+# ///
 """Adapter for https://github.com/charliermarsh/ruff."""
 
 from __future__ import annotations
@@ -14,13 +20,10 @@ import sys
 import time
 from typing import Any, BinaryIO
 
+
 LINTER_CODE = "RUFF"
+SYNTAX_ERROR = "E999"
 IS_WINDOWS: bool = os.name == "nt"
-
-
-def eprint(*args: Any, **kwargs: Any) -> None:
-    """Print to stderr."""
-    print(*args, file=sys.stderr, flush=True, **kwargs)
 
 
 class LintSeverity(str, enum.Enum):
@@ -115,7 +118,7 @@ def run_command(
             if remaining_retries == 0:
                 raise err
             remaining_retries -= 1
-            logging.warning(
+            logging.warning(  # noqa: G200
                 "(%s/%s) Retrying because command failed with: %r",
                 retries - remaining_retries,
                 retries,
@@ -187,7 +190,7 @@ def get_issue_severity(code: str) -> LintSeverity:
 
     # "F821": Undefined name
     # "E999": syntax error
-    if any(code.startswith(x) for x in ("F821", "E999", "PLE")):
+    if any(code.startswith(x) for x in ("F821", SYNTAX_ERROR, "PLE")):
         return LintSeverity.ERROR
 
     # "F": PyFlakes Error
@@ -225,6 +228,7 @@ def check_files(
                 sys.executable,
                 "-m",
                 "ruff",
+                "check",
                 "--exit-zero",
                 "--quiet",
                 "--output-format=json",
@@ -268,27 +272,28 @@ def check_files(
     else:
         rules = {}
 
-    return [
-        LintMessage(
+    def lint_message(vuln: dict[str, Any]) -> LintMessage:
+        code = vuln["code"] or SYNTAX_ERROR
+        return LintMessage(
             path=vuln["filename"],
-            name=vuln["code"],
+            name=code,
             description=(
                 format_lint_message(
                     vuln["message"],
-                    vuln["code"],
+                    code,
                     rules,
-                    show_disable,
+                    show_disable and bool(vuln["code"]),
                 )
             ),
             line=int(vuln["location"]["row"]),
             char=int(vuln["location"]["column"]),
             code=LINTER_CODE,
-            severity=severities.get(vuln["code"], get_issue_severity(vuln["code"])),
+            severity=severities.get(code, get_issue_severity(code)),
             original=None,
             replacement=None,
         )
-        for vuln in vulnerabilities
-    ]
+
+    return [lint_message(v) for v in vulnerabilities]
 
 
 def check_file_for_fixes(
@@ -307,6 +312,7 @@ def check_file_for_fixes(
                     sys.executable,
                     "-m",
                     "ruff",
+                    "check",
                     "--fix-only",
                     "--exit-zero",
                     *([f"--config={config}"] if config else []),
@@ -415,7 +421,8 @@ def main() -> None:
     if args.severity:
         for severity in args.severity:
             parts = severity.split(":", 1)
-            assert len(parts) == 2, f"invalid severity `{severity}`"
+            if len(parts) != 2:
+                raise AssertionError(f"invalid severity `{severity}`")
             severities[parts[0]] = LintSeverity(parts[1])
 
     lint_messages = check_files(

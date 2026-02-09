@@ -33,7 +33,8 @@
     "torch.nn.quantizable": "torch.ao.nn.quantizable",
     "torch.nn.quantizable.modules": "torch.ao.nn.quantizable.modules",
     "torch.nn.quantizable.modules.activation": "torch.ao.nn.quantizable.modules.activation",
-    "torch.nn.quantizable.modules.rnn": "torch.ao.nn.quantizable.modules.rnn"
+    "torch.nn.quantizable.modules.rnn": "torch.ao.nn.quantizable.modules.rnn",
+    "torch.distributed.tensor.device_mesh": "torch.distributed.device_mesh"
   },
   "torch.backends": [
     "contextmanager"
@@ -261,7 +262,9 @@
     "Future"
   ],
   "torch.fx": [
+    "PH",
     "ProxyableClassMeta",
+    "CodeGen",
     "Tracer",
     "symbolic_trace",
     "wrap"
@@ -476,6 +479,31 @@
     "vecdot",
     "vector_norm"
   ],
+  "torch.masked": [
+    "amax",
+    "amin",
+    "argmax",
+    "argmin",
+    "as_masked_tensor",
+    "cumprod",
+    "cumsum",
+    "is_masked_tensor",
+    "log_softmax",
+    "logaddexp",
+    "logsumexp",
+    "masked_tensor",
+    "MaskedTensor",
+    "mean",
+    "median",
+    "norm",
+    "normalize",
+    "prod",
+    "softmax",
+    "softmin",
+    "std",
+    "sum",
+    "var"
+  ],
   "torch.multiprocessing": [
     "Array",
     "AuthenticationError",
@@ -629,13 +657,6 @@
   "torch.nn.utils.convert_parameters": [
     "Iterable",
     "Optional"
-  ],
-  "torch.onnx": [
-    "Dict",
-    "OperatorExportTypes",
-    "Optional",
-    "TensorProtoDataType",
-    "TrainingMode"
   ],
   "torch.overrides": [
     "BaseTorchFunctionMode",
@@ -1000,10 +1021,10 @@
   "torch.types": [
     "Any",
     "Device",
+    "FileLike",
     "List",
     "Number",
     "Sequence",
-    "Tuple",
     "Union"
   ],
   "torch.utils.benchmark.utils.compare": [
@@ -1901,7 +1922,6 @@
     "get_torch_dispatch_modes",
     "has_proxy_slot",
     "is_sym_node",
-    "maybe_disable_fake_tensor_mode",
     "maybe_handle_decomp",
     "proxy_call",
     "set_meta",
@@ -1974,13 +1994,12 @@
     "RelaxedUnspecConstraint",
     "RuntimeAssert",
     "ShapeGuardPrinter",
+    "ShapeGuardPythonPrinter",
     "StrictMinMaxConstraint",
     "bind_symbols",
     "cast_symbool_to_symint_guardless",
     "constrain_range",
     "constrain_unify",
-    "definitely_false",
-    "definitely_true",
     "error",
     "eval_guards",
     "eval_is_non_overlapping_and_dense",
@@ -2181,21 +2200,6 @@
     "Tuple",
     "abstractmethod"
   ],
-  "torch.onnx.verification": [
-    "Any",
-    "Callable",
-    "Collection",
-    "Dict",
-    "FrozenSet",
-    "List",
-    "Mapping",
-    "Number",
-    "Optional",
-    "Sequence",
-    "Set",
-    "Tuple",
-    "Union"
-  ],
   "torch.quantization.fx": [
     "convert",
     "fuse",
@@ -2355,15 +2359,6 @@
   ],
   "torch.utils.collect_env": [
     "namedtuple"
-  ],
-  "torch.utils.data.datapipes.gen_pyi": [
-    "Any",
-    "Dict",
-    "List",
-    "Set",
-    "Tuple",
-    "Union",
-    "defaultdict"
   ],
   "torch.utils.data.datapipes.utils.snapshot": [
     "IterDataPipe",
@@ -2667,35 +2662,6 @@
   "torch.mtia": [
     "DeferredMtiaCallError",
     "StreamContext"
-  ],
-  "torch.onnx.symbolic_helper": [
-    "Any",
-    "Callable",
-    "List",
-    "Literal",
-    "NoReturn",
-    "Number",
-    "Optional",
-    "Sequence",
-    "Set",
-    "Tuple",
-    "Union"
-  ],
-  "torch.onnx.symbolic_opset18": [
-    "amax",
-    "amin",
-    "aminmax",
-    "embedding_bag",
-    "linalg_vector_norm",
-    "max",
-    "maximum",
-    "min",
-    "minimum"
-  ],
-  "torch.onnx.symbolic_opset20": [
-    "_affine_grid_generator",
-    "_grid_sampler",
-    "convert_grid_sample_mode"
   ],
   "torch.utils.data.datapipes.dataframe.dataframe_wrapper": [
     "Any",

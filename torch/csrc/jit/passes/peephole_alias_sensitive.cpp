@@ -1,15 +1,8 @@
-#include <ATen/core/jit_type.h>
 #include <torch/csrc/jit/ir/alias_analysis.h>
-#include <torch/csrc/jit/ir/ir_views.h>
 #include <torch/csrc/jit/jit_log.h>
-#include <torch/csrc/jit/passes/dead_code_elimination.h>
-#include <torch/csrc/jit/passes/peephole.h>
 #include <torch/csrc/jit/passes/peephole_alias_sensitive.h>
-#include <torch/csrc/jit/runtime/graph_executor.h>
-#include <unordered_set>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 // This pass only does optimizations which requires Alias Analysis
 // It is separated out from Peephole Pass so that Peephole does not have
@@ -27,7 +20,7 @@ struct PeepholeOptimizeAliasSensitiveImpl {
   }
 
  private:
-  void replaceWithIValue(Value* v, IValue val) {
+  void replaceWithIValue(Value* v, const IValue& val) {
     WithInsertPoint guard(v->node());
     v->replaceAllUsesWith(v->owningGraph()->insertConstant(val));
   }
@@ -170,5 +163,4 @@ bool PeepholeOptimizeAliasSensitive(
   return opt.run();
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

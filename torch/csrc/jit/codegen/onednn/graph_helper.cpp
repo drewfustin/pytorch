@@ -1,14 +1,9 @@
-#include <torch/csrc/jit/codegen/onednn/LlgaTensorImpl.h>
 #include <torch/csrc/jit/codegen/onednn/graph_helper.h>
 
-#include <ATen/core/functional.h>
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
 
-namespace torch {
-namespace jit {
-namespace fuser {
-namespace onednn {
+namespace torch::jit::fuser::onednn {
 
 using opkind = dnnl::graph::op::kind;
 
@@ -26,7 +21,7 @@ static std::optional<size_t> getDimensions(Value* v) {
   if (v->type()->isSubtypeOf(TensorType::get())) {
     return v->type()->cast<TensorType>()->sizes().size();
   } else {
-    return c10::nullopt;
+    return std::nullopt;
   }
 }
 
@@ -73,7 +68,7 @@ Operator LlgaGraphHelper::makeBinaryOp(Node* node, opkind kind) {
 // third_party/ideep/mkl-dnn/src/interface/op_def.hpp.
 Operator LlgaGraphHelper::createOperator(Node* node) {
   auto nodeKind = node->kind();
-  // we're using an if-else clause instead of a switch staement
+  // we're using an if-else clause instead of a switch statement
   // because we would soon be adding custom ops with function schemas.
   // We would have to use Symbol::fromQualString at that time anyway,
   // but we are okay with this choice, since this code is not in the hot-path.
@@ -355,9 +350,9 @@ static void mayAddListConstructIntoConcatPartition(
   // We emphasize on 'virtually' because get_num_ops() for cat's partition
   // would still return 1.
   if (n->kind() == aten::cat && opToOwningPartition.has(n)) {
-    auto listConstrcut = n->namedInput("tensors")->node();
+    auto listConstruct = n->namedInput("tensors")->node();
     auto partitionId = opToOwningPartition.get(n);
-    opToOwningPartition.add(listConstrcut, partitionId);
+    opToOwningPartition.add(listConstruct, partitionId);
   }
 }
 
@@ -615,7 +610,4 @@ bool LlgaNodeWrapper::useOpaqueLayout(size_t offset) const {
   return n->is(attr::output_layouts)[offset] == OPAQUE_LAYOUT;
 }
 
-} // namespace onednn
-} // namespace fuser
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::fuser::onednn

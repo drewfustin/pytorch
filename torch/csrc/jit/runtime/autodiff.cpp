@@ -1,6 +1,5 @@
 #include <torch/csrc/jit/runtime/autodiff.h>
 
-#include <ATen/core/functional.h>
 #include <c10/util/Exception.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/jit/jit_log.h>
@@ -134,11 +133,11 @@ static std::optional<std::vector<Value*>> build_script_grad(
   auto graph = node->owningGraph();
   auto maybe_schema = node->maybeSchema();
   if (!maybe_schema) {
-    return c10::nullopt;
+    return std::nullopt;
   }
   auto compiled_graphs = gradientInfoForSchema(*maybe_schema);
   if (!compiled_graphs) {
-    return c10::nullopt;
+    return std::nullopt;
   }
   // Use forward graph to replace node in grad_desc.f
   value_list new_outputs;
@@ -167,7 +166,7 @@ static std::optional<std::vector<Value*>> build_script_grad(
   auto grad_inputs = insertGraph(*graph, *bw_graph, grad);
   grad_inputs = unpackOutputs(grad_inputs);
   return grad_inputs;
-};
+}
 
 namespace {
 class GradientHelper {
@@ -206,8 +205,7 @@ class GradientHelper {
     } else if (node->kind() == prim::ConstantChunk) {
       auto* g = node->owningGraph();
 
-      // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-      Value* input_list;
+      Value* input_list = nullptr;
       if (grad_values.size() == 1 &&
           grad_values[0]->type()->isSubtypeOf(*ListType::ofTensors())) {
         input_list = grad_values[0];
@@ -575,8 +573,7 @@ static void foldSizeIfNotEqual(Node* node) {
     // insert in front of _grad_sum_to_size
     WithInsertPoint guard(node);
     IValue ival{};
-    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-    Value* size;
+    Value* size = nullptr;
     if (input_size != output_size) {
       size = node->owningGraph()->insertConstant(*input_size);
     } else {

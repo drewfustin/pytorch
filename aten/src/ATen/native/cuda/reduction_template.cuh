@@ -1,5 +1,4 @@
-namespace at {
-namespace cuda {
+namespace at::cuda {
 //windows doesn't like large string literals, so split in two
 const std::string reduction_template_0 = R"ESCAPE(
   #define C10_HOST_DEVICE __host__ __device__
@@ -185,8 +184,8 @@ struct ReduceJitOp {
   using OutputCalculator = OffsetCalculator<2>;
 
 //   static constexpr bool can_accumulate_in_output =
-//     std::is_convertible<arg_t, out_scalar_t>::value
-//     && std::is_convertible<out_scalar_t, arg_t>::value;
+//     std::is_convertible_v<arg_t, out_scalar_t>
+//     && std::is_convertible_v<out_scalar_t, arg_t>;
 
   static constexpr int input_vec_size = ReduceConfig::input_vec_size;
 
@@ -223,13 +222,13 @@ struct ReduceJitOp {
       value = thread_reduce<${output_vec_size}>(input_slice);
     }
 
-    if (config.should_block_y_reduce()) {
-      value = block_y_reduce<${output_vec_size}>(value, shared_memory);
-    }
     if (config.should_block_x_reduce()) {
       value = block_x_reduce<${output_vec_size}>(value, shared_memory);
     }
 
+    if (config.should_block_y_reduce()) {
+      value = block_y_reduce<${output_vec_size}>(value, shared_memory);
+    }
     using out_ptr_vec_t = Array<out_scalar_t*, ${output_vec_size}>;
     using offset_vec_t = Array<uint32_t, ${output_vec_size}>;
     offset_vec_t base_offsets;
@@ -467,7 +466,11 @@ struct ReduceJitOp {
 
     __syncthreads();
 
+    #if defined(USE_ROCM) || defined(FBCODE_CAFFE2)
     for (int offset = 1; offset < dim_x; offset <<= 1) {
+    #else
+    for (int offset = dim_x >> 1; offset > 0; offset >>= 1) {
+    #endif
       #pragma unroll
       for (int i = 0; i < output_vec_size; i++) {
         arg_t other = reducer::warp_shfl_down(value[i], offset);
@@ -678,4 +681,4 @@ const std::string &get_reduction_template() {
   return reduction_template;
 }
 
-}}
+} // namespace at::cuda

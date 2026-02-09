@@ -24,8 +24,7 @@
 #include <utility>
 #include <vector>
 
-namespace torch {
-namespace autograd {
+namespace torch::autograd {
 
 // Returns a ViewFunc with a corresponding view that matches the shape,
 // stride, and storage offset of the given tensor.
@@ -116,8 +115,8 @@ ViewInfo ViewInfo::chain(
         // view_func() AND as_strided() isn't supported; there's no obvious way
         // to chain the two views.
         auto error_msg =
-            ("Attempted to chain views when the parent view has no view_func() and "
-             "does not support as_strided(). This is not supported.");
+            "Attempted to chain views when the parent view has no view_func() and "
+            "does not support as_strided(). This is not supported.";
         view_func = std::make_unique<ErroringViewFunc>(error_msg);
         rev_view_func = [=](const at::Tensor& root_view) {
           TORCH_CHECK(false, error_msg);
@@ -255,7 +254,7 @@ void create_cpp_hook(const at::TensorBase& self, bool is_retains_grad_hook) {
   const auto& fn = self.grad_fn();
   std::shared_ptr<hooks_list>& list =
       materialize_autograd_meta(self)->cpp_hooks_list_;
-  list.reset(new hooks_list());
+  list = std::make_shared<hooks_list>();
   auto hook_ptr =
       std::make_unique<CppFunctionTensorPreHook>(list, self.output_nr());
   // NB: we could potentially only update hooks_ if !fn, but it shouldn't
@@ -275,12 +274,16 @@ void set_grad_accumulator(
       std::move(grad_accumulator);
 }
 
-std::shared_ptr<Node> try_get_grad_accumulator(const Variable& self) {
+std::shared_ptr<Node> try_get_grad_accumulator(const at::TensorBase& self) {
   if (get_autograd_meta(self)) {
     return get_autograd_meta(self)->grad_accumulator_.lock();
   } else {
     return nullptr;
   }
+}
+
+std::shared_ptr<Node> try_get_grad_accumulator(const Variable& self) {
+  return try_get_grad_accumulator(get_tensor_base(self));
 }
 
 std::shared_ptr<Node> grad_accumulator(const Variable& self) {
@@ -598,10 +601,9 @@ void VariableHooks::_backward(
 void VariableHooks::requires_grad_(
     const at::TensorBase& self,
     bool _requires_grad) const {
-  if (!self.is_leaf() && !_requires_grad) {
-    throw std::runtime_error(
-        autograd::utils::requires_grad_leaf_error(_requires_grad));
-  }
+  TORCH_CHECK(
+      self.is_leaf() || _requires_grad,
+      autograd::utils::requires_grad_leaf_error(_requires_grad));
   self.set_requires_grad(_requires_grad);
 }
 
@@ -625,7 +627,7 @@ const at::TensorBase& VariableHooks::base(const at::TensorBase& self) const {
         "Can't get base of non-backward view Tensor");
     return diff_view_meta->get_backward_view().base_;
   } else {
-    throw std::runtime_error("Can't get base of non-view Tensor");
+    TORCH_CHECK(false, "Can't get base of non-view Tensor");
   }
 }
 
@@ -715,7 +717,8 @@ const std::shared_ptr<torch::autograd::Node>& VariableHooks::grad_fn(
             self.sym_sizes(), // Note: sizes(), not base_.sizes(), is
                               // intentional
             self.unsafeGetTensorImpl()->is_python_dispatch(),
-            self.is_nested());
+            self.is_nested(),
+            self.grad_dtype());
         diff_view_meta->grad_fn_ = std::move(fn);
       }
       diff_view_meta->set_attr_version(current_version);
@@ -887,9 +890,11 @@ std::unique_ptr<ViewFunc> ChainedViewFunc::clone_and_set(
   if (symints.has_value()) {
     TORCH_INTERNAL_ASSERT(symints->size() == num_symints());
     first_symints = std::vector<c10::SymInt>(
-        symints->begin(), symints->begin() + first->num_symints());
+        symints->begin(),
+        symints->begin() + static_cast<std::ptrdiff_t>(first->num_symints()));
     second_symints = std::vector<c10::SymInt>(
-        symints->begin() + first->num_symints(), symints->end());
+        symints->begin() + static_cast<std::ptrdiff_t>(first->num_symints()),
+        symints->end());
   }
 
   std::optional<std::vector<at::Tensor>> first_tensors;
@@ -897,9 +902,11 @@ std::unique_ptr<ViewFunc> ChainedViewFunc::clone_and_set(
   if (tensors.has_value()) {
     TORCH_INTERNAL_ASSERT(tensors->size() == num_tensors());
     first_tensors = std::vector<at::Tensor>(
-        tensors->begin(), tensors->begin() + first->num_tensors());
+        tensors->begin(),
+        tensors->begin() + static_cast<std::ptrdiff_t>(first->num_tensors()));
     second_tensors = std::vector<at::Tensor>(
-        tensors->begin() + first->num_tensors(), tensors->end());
+        tensors->begin() + static_cast<std::ptrdiff_t>(first->num_tensors()),
+        tensors->end());
   }
 
   return std::make_unique<ChainedViewFunc>(
@@ -907,5 +914,45 @@ std::unique_ptr<ViewFunc> ChainedViewFunc::clone_and_set(
       second->clone_and_set(second_symints, second_tensors));
 }
 
-} // namespace autograd
-} // namespace torch
+std::optional<c10::ScalarType> VariableHooks::grad_dtype(
+    const at::TensorBase& self) const {
+  if (auto* meta = impl::get_autograd_meta(self)) {
+    return meta->grad_dtype(self);
+  }
+  return self.scalar_type();
+}
+
+void VariableHooks::set_grad_dtype(
+    const at::TensorBase& self,
+    const std::optional<c10::ScalarType>& grad_dtype) const {
+  auto* meta = impl::materialize_autograd_meta(self);
+  meta->set_grad_dtype(grad_dtype, self);
+}
+
+std::optional<at::ScalarType> AutogradMeta::grad_dtype(
+    const at::TensorBase& self) const {
+  if (allow_grad_dtype_mismatch_) {
+    return std::nullopt;
+  } else if (grad_dtype_.has_value()) {
+    return grad_dtype_;
+  } else {
+    return std::optional<at::ScalarType>(self.scalar_type());
+  }
+}
+void AutogradMeta::set_grad_dtype(
+    const std::optional<at::ScalarType>& grad_dtype,
+    const at::TensorBase& self) {
+  TORCH_CHECK(!grad_fn_, "grad_dtype can only be set on leaf tensors.");
+  if (grad_dtype.has_value()) {
+    grad_dtype_ = grad_dtype;
+    allow_grad_dtype_mismatch_ = false;
+  } else {
+    allow_grad_dtype_mismatch_ = true;
+  }
+  auto grad_acc = impl::try_get_grad_accumulator(self);
+  if (grad_acc) {
+    grad_acc->mutable_input_metadata(0).set_grad_dtype(grad_dtype);
+  }
+}
+
+} // namespace torch::autograd

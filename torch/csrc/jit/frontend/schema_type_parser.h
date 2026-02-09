@@ -6,10 +6,13 @@
 #include <c10/util/FunctionRef.h>
 #include <torch/csrc/jit/frontend/lexer.h>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 using TypePtr = c10::TypePtr;
+
+TORCH_API void registerOpaqueType(const std::string& type_name);
+TORCH_API void unregisterOpaqueType(const std::string& type_name);
+TORCH_API bool isRegisteredOpaqueType(const std::string& type_name);
 
 struct TORCH_API SchemaTypeParser {
   TypePtr parseBaseType();
@@ -42,5 +45,4 @@ struct TORCH_API SchemaTypeParser {
   size_t next_id = 0;
   bool allow_typevars_;
 };
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

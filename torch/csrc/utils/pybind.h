@@ -19,13 +19,15 @@
 
 namespace py = pybind11;
 
+#define IS_PYBIND_2_13_PLUS PYBIND11_VERSION_HEX >= 0x020D0000
+
 // This makes intrusive_ptr to be available as a custom pybind11 holder type,
 // see
 // https://pybind11.readthedocs.io/en/stable/advanced/smart_ptrs.html#custom-smart-pointers
-PYBIND11_DECLARE_HOLDER_TYPE(T, c10::intrusive_ptr<T>, true);
+PYBIND11_DECLARE_HOLDER_TYPE(T, c10::intrusive_ptr<T>, true)
 
-PYBIND11_DECLARE_HOLDER_TYPE(T, c10::SingletonOrSharedTypePtr<T>);
-PYBIND11_DECLARE_HOLDER_TYPE(T, c10::SingletonTypePtr<T>, true);
+PYBIND11_DECLARE_HOLDER_TYPE(T, c10::SingletonOrSharedTypePtr<T>)
+PYBIND11_DECLARE_HOLDER_TYPE(T, c10::SingletonTypePtr<T>, true)
 
 namespace pybind11::detail {
 
@@ -36,7 +38,7 @@ struct TORCH_PYTHON_API type_caster<at::Tensor> {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(at::Tensor, _("torch.Tensor"));
 
-  bool load(handle src, bool);
+  bool load(handle src, bool /*unused*/);
 
   static handle cast(
       const at::Tensor& src,
@@ -51,7 +53,7 @@ struct type_caster<at::Storage> {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(at::Storage, _("torch.StorageBase"));
 
-  bool load(handle src, bool) {
+  bool load(handle src, bool /*unused*/) {
     PyObject* obj = src.ptr();
     if (torch::isStorage(obj)) {
       value = torch::createStorage(obj);
@@ -74,7 +76,7 @@ struct type_caster<at::Generator> {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(at::Generator, _("torch.Generator"));
 
-  bool load(handle src, bool) {
+  bool load(handle src, bool /*unused*/) {
     PyObject* obj = src.ptr();
     if (THPGenerator_Check(obj)) {
       value = reinterpret_cast<THPGenerator*>(obj)->cdata;
@@ -97,7 +99,7 @@ struct TORCH_PYTHON_API type_caster<at::IntArrayRef> {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(at::IntArrayRef, _("Tuple[int, ...]"));
 
-  bool load(handle src, bool);
+  bool load(handle src, bool /*unused*/);
   static handle cast(
       at::IntArrayRef src,
       return_value_policy /* policy */,
@@ -113,7 +115,7 @@ struct TORCH_PYTHON_API type_caster<at::SymIntArrayRef> {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(at::SymIntArrayRef, _("List[int]"));
 
-  bool load(handle src, bool);
+  bool load(handle src, bool /*unused*/);
   static handle cast(
       at::SymIntArrayRef src,
       return_value_policy /* policy */,
@@ -129,7 +131,7 @@ struct TORCH_PYTHON_API type_caster<at::ArrayRef<c10::SymNode>> {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(at::ArrayRef<c10::SymNode>, _("List[SymNode]"));
 
-  bool load(handle src, bool);
+  bool load(handle src, bool /*unused*/);
   static handle cast(
       at::ArrayRef<c10::SymNode> src,
       return_value_policy /* policy */,
@@ -145,7 +147,7 @@ struct type_caster<at::MemoryFormat> {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(at::MemoryFormat, _("torch.memory_format"));
 
-  bool load(handle src, bool) {
+  bool load(handle src, bool /*unused*/) {
     PyObject* obj = src.ptr();
     if (THPMemoryFormat_Check(obj)) {
       value = reinterpret_cast<THPMemoryFormat*>(obj)->memory_format;
@@ -173,7 +175,7 @@ struct type_caster<at::Device> {
   // after a successful call to load.
   type_caster() : value(c10::kCPU) {}
 
-  bool load(handle src, bool) {
+  bool load(handle src, bool /*unused*/) {
     PyObject* obj = src.ptr();
     if (THPDevice_Check(obj)) {
       value = reinterpret_cast<THPDevice*>(obj)->device;
@@ -202,7 +204,7 @@ struct type_caster<at::ScalarType> {
   // after a successful call to load.
   type_caster() : value(at::kFloat) {}
 
-  bool load(handle src, bool) {
+  bool load(handle src, bool /*unused*/) {
     PyObject* obj = src.ptr();
     if (THPDtype_Check(obj)) {
       value = reinterpret_cast<THPDtype*>(obj)->scalar_type;
@@ -231,7 +233,7 @@ struct type_caster<c10::Stream> {
   // after a successful call to load.
   type_caster() : value(c10::Stream::DEFAULT, c10::Device(c10::kCPU, 0)) {}
 
-  bool load(handle src, bool) {
+  bool load(handle src, bool /*unused*/) {
     PyObject* obj = src.ptr();
     if (THPStream_Check(obj)) {
       value = c10::Stream::unpack3(
@@ -284,7 +286,7 @@ struct TORCH_PYTHON_API type_caster<c10::Scalar> {
   PYBIND11_TYPE_CASTER(
       c10::Scalar,
       _("Union[Number, torch.SymInt, torch.SymFloat, torch.SymBool]"));
-  bool load(py::handle src, bool);
+  bool load(py::handle src, bool /*unused*/);
 
   static py::handle cast(
       const c10::Scalar& si,
@@ -296,7 +298,7 @@ template <>
 struct TORCH_PYTHON_API type_caster<c10::SymInt> {
  public:
   PYBIND11_TYPE_CASTER(c10::SymInt, _("Union[int, torch.SymInt]"));
-  bool load(py::handle src, bool);
+  bool load(py::handle src, bool /*unused*/);
 
   static py::handle cast(
       const c10::SymInt& si,
@@ -308,7 +310,7 @@ template <>
 struct TORCH_PYTHON_API type_caster<c10::SymFloat> {
  public:
   PYBIND11_TYPE_CASTER(c10::SymFloat, _("float"));
-  bool load(py::handle src, bool);
+  bool load(py::handle src, bool /*unused*/);
 
   static py::handle cast(
       const c10::SymFloat& si,
@@ -320,7 +322,7 @@ template <>
 struct TORCH_PYTHON_API type_caster<c10::SymBool> {
  public:
   PYBIND11_TYPE_CASTER(c10::SymBool, _("Union[bool, torch.SymBool]"));
-  bool load(py::handle src, bool);
+  bool load(py::handle src, bool /*unused*/);
 
   static py::handle cast(
       const c10::SymBool& si,
@@ -334,10 +336,10 @@ struct type_caster<c10::complex<T>> {
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(c10::complex<T>, _("complex"));
 
-  bool load(handle src, bool) {
+  bool load(handle src, bool /*unused*/) {
     PyObject* obj = src.ptr();
 
-    // Refered from `THPUtils_unpackComplexDouble`
+    // Referred from `THPUtils_unpackComplexDouble`
     Py_complex py_complex = PyComplex_AsCComplex(obj);
     if (py_complex.real == -1.0 && PyErr_Occurred()) {
       return false;

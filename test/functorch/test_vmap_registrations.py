@@ -5,7 +5,6 @@ import unittest
 from torch._C import (
     _dispatch_get_registrations_for_dispatch_key as get_registrations_for_dispatch_key,
 )
-
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -13,6 +12,7 @@ from torch.testing._internal.common_utils import (
     subtest,
     TestCase,
 )
+
 
 xfail_functorch_batched = {
     "aten::is_nonzero",
@@ -63,7 +63,6 @@ xfail_not_implemented = {
     "aten::diagflat",
     "aten::divide.out_mode",
     "aten::divide_.Scalar",
-    "aten::dropout",
     "aten::dropout_",
     "aten::embedding_bag",
     "aten::embedding_bag.padding_idx",
@@ -121,7 +120,6 @@ xfail_not_implemented = {
     "aten::lu_solve",
     "aten::margin_ranking_loss",
     "aten::masked_select_backward",
-    "aten::matrix_exp",
     "aten::matrix_exp_backward",
     "aten::max.names_dim",
     "aten::max.names_dim_max",
@@ -210,6 +208,7 @@ xfail_not_implemented = {
     "aten::subtract_.Scalar",
     "aten::subtract_.Tensor",
     "aten::svd.U",
+    "aten::sym_is_contiguous",
     "aten::sym_size.int",
     "aten::sym_stride.int",
     "aten::sym_numel",
@@ -228,6 +227,8 @@ xfail_not_implemented = {
     "aten::var_mean.correction_names",
     "aten::var_mean.names_dim",
     "aten::where",
+    "aten::wrapped_linear_prepack",
+    "aten::wrapped_quantized_linear_prepacked",
 }
 
 

@@ -37,6 +37,8 @@ class PerfEvent {
  public:
   explicit PerfEvent(std::string& name) : name_(name) {}
 
+  PerfEvent(const PerfEvent& other) = delete;
+  PerfEvent& operator=(const PerfEvent&) = delete;
   PerfEvent& operator=(PerfEvent&& other) noexcept {
     if (this != &other) {
       fd_ = other.fd_;
@@ -86,7 +88,7 @@ class PerfProfiler {
 
   /* Disable counting and fill in the caller supplied container with delta
    * calculated from the start count values since last Enable() */
-  void Disable(perf_counters_t&);
+  void Disable(perf_counters_t& /*vals*/);
 
  private:
   uint64_t CalcDelta(uint64_t start, uint64_t end) const;

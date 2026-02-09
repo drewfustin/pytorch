@@ -5,6 +5,7 @@
 #include <torch/csrc/profiler/orchestration/vulkan.h>
 #endif // USE_KINETO
 
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -170,16 +171,10 @@ void QueryPool::extract_results() {
   results_pending_ = false;
 }
 
-std::ostream& operator<<(std::ostream& os, const VkExtent3D& extents) {
-  os << "{" << extents.width << ", " << extents.height << ", " << extents.depth
-     << "}";
-  return os;
-}
-
-std::string stringize(const VkExtent3D& extents) {
+static std::string stringize(const VkExtent3D& extents) {
   std::stringstream ss;
-  ss << "{" << extents.width << ", " << extents.height << ", " << extents.depth
-     << "}";
+  ss << '{' << extents.width << ", " << extents.height << ", " << extents.depth
+     << '}';
   return ss.str();
 }
 

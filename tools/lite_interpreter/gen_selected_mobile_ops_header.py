@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
+
+from __future__ import annotations
+
 import argparse
 import os
-from typing import Set
 
 import yaml
 
 from torchgen.code_template import CodeTemplate
 from torchgen.selective_build.selector import SelectiveBuilder
+
 
 # Safely load fast C Yaml loader/dumper if they are available
 try:
@@ -22,17 +25,17 @@ if_condition_template = CodeTemplate(if_condition_template_str)
 
 selected_kernel_dtypes_h_template_str = """
 #include <c10/core/ScalarType.h>
-#include <c10/util/string_view.h>
 #include <c10/macros/Macros.h>
+#include <string_view>
 
 namespace at {
 inline constexpr bool should_include_kernel_dtype(
   const char *kernel_tag_str,
   at::ScalarType scalar_type
 ) {
-  c10::string_view kernel_tag_sv C10_UNUSED = c10::string_view(kernel_tag_str);
-  $body
-  return false;
+  [[maybe_unused]] auto kernel_tag_sv =
+      std::string_view(kernel_tag_str);
+  $body return false;
 }
 }
 """
@@ -46,7 +49,7 @@ selected_mobile_ops_preamble = """#pragma once
 """
 
 
-def extract_root_operators(selective_builder: SelectiveBuilder) -> Set[str]:
+def extract_root_operators(selective_builder: SelectiveBuilder) -> set[str]:
     ops = []
     for op_name, op in selective_builder.operators.items():
         if op.is_root_operator:
@@ -70,6 +73,7 @@ def get_selected_kernel_dtypes_code(
         for kernel_tag, dtypes in selective_builder.kernel_metadata.items():
             conditions = ["scalar_type == at::ScalarType::" + x for x in dtypes]
             body_parts.append(
+                # pyrefly: ignore [bad-argument-type]
                 if_condition_template.substitute(
                     kernel_tag_name=kernel_tag,
                     dtype_checks=" || ".join(conditions),
@@ -125,7 +129,7 @@ def write_selected_mobile_ops(
 # 2. All kernel dtypes
 def write_selected_mobile_ops_with_all_dtypes(
     output_file_path: str,
-    root_ops: Set[str],
+    root_ops: set[str],
 ) -> None:
     with open(output_file_path, "wb") as out_file:
         body_parts = [selected_mobile_ops_preamble]
@@ -158,8 +162,7 @@ def main() -> None:
         "--output_file_path",
         type=str,
         required=True,
-        help="Path to destination"
-        "folder where selected_mobile_ops.h will be written.",
+        help="Path to destinationfolder where selected_mobile_ops.h will be written.",
     )
     parsed_args = parser.parse_args()
     model_file_name = parsed_args.yaml_file_path

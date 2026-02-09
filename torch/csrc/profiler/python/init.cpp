@@ -2,6 +2,7 @@
 
 #include <ATen/record_function.h>
 #include <c10/core/impl/PyInterpreter.h>
+#include <c10/util/Exception.h>
 #include <c10/util/overloaded.h>
 #include <torch/csrc/DynamicTypes.h>
 #include <torch/csrc/autograd/utils/wrap_outputs.h>
@@ -12,7 +13,8 @@
 #include <torch/csrc/utils/pybind.h>
 
 struct THPCapturedTraceback {
-  PyObject_HEAD std::shared_ptr<torch::CapturedTraceback> data;
+  PyObject_HEAD
+  std::shared_ptr<torch::CapturedTraceback> data;
 };
 
 static int THPCapturedTraceback_traverse(
@@ -36,10 +38,9 @@ static void THPCapturedTraceback_dealloc(PyObject* self_) {
   PyObject_GC_Del(self);
 }
 
-PyTypeObject THPCapturedTracebackType = {
-    PyVarObject_HEAD_INIT(
-        nullptr,
-        0) "torch._C._profiler.CapturedTraceback", /* tp_name */
+static PyTypeObject THPCapturedTracebackType = {
+    PyVarObject_HEAD_INIT(nullptr, 0)
+    "torch._C._profiler.CapturedTraceback", /* tp_name */
     sizeof(THPCapturedTraceback), /* tp_basicsize */
     0, /* tp_itemsize */
     THPCapturedTraceback_dealloc, /* tp_dealloc */
@@ -88,7 +89,7 @@ struct type_caster<std::shared_ptr<torch::CapturedTraceback>> {
       std::shared_ptr<torch::CapturedTraceback>,
       _("torch._C._profiler.CapturedTraceback"));
 
-  bool load(handle src, bool) {
+  bool load(handle src, bool /*unused*/) {
     if (Py_TYPE(src.ptr()) == &THPCapturedTracebackType) {
       value = reinterpret_cast<THPCapturedTraceback*>(src.ptr())->data;
       return true;
@@ -136,7 +137,8 @@ namespace torch::profiler {
 
 namespace {
 struct RecordFunctionFast {
-  PyObject_HEAD PyObject* name;
+  PyObject_HEAD
+  PyObject* name;
   PyObject* input_values;
   PyObject* keyword_values;
   std::unique_ptr<at::RecordFunction> guard;
@@ -219,8 +221,7 @@ PyObject* RecordFunctionFast_enter(PyObject* selfGeneric, PyObject* unused) {
     TORCH_INTERNAL_ASSERT(
         !self->guard,
         "Trying to enter a new record_function_fast context but the guard is unexpectedly already set");
-    self->guard =
-        std::make_unique<at::RecordFunction>(at::RecordScope::FUNCTION);
+    auto scope = at::RecordScope::FUNCTION;
     std::vector<at::IValue> args;
     std::unordered_map<std::string, at::IValue> kwargs;
     bool profiler_need_input = torch::autograd::profiler::profilerEnabled() &&
@@ -250,9 +251,34 @@ PyObject* RecordFunctionFast_enter(PyObject* selfGeneric, PyObject* unused) {
         if (THPUtils_checkString(value)) {
           ivalue = at::IValue(THPUtils_unpackString(value));
         } else {
+          // Handle other types (not strings, not lists)
           auto match = torch::jit::tryToInferPrimitiveType(value);
           if (match.success()) {
             ivalue = torch::jit::toIValue(value, match.type());
+          } else if (PyList_Check(value)) {
+            // Handle list of strings
+            bool all_strings = true;
+            std::vector<std::string> string_list;
+            Py_ssize_t list_size = PyList_Size(value);
+
+            for (Py_ssize_t i = 0; i < list_size; i++) {
+              PyObject* item = PyList_GetItem(value, i);
+              if (THPUtils_checkString(item)) {
+                string_list.push_back(THPUtils_unpackString(item));
+              } else {
+                all_strings = false;
+                break;
+              }
+            }
+
+            if (all_strings) {
+              c10::List<std::string> string_ivalue_list(string_list);
+              ivalue = at::IValue(string_ivalue_list);
+            } else {
+              TORCH_WARN(
+                  "Unable to infer type of value in the List for keyword: ",
+                  key_str);
+            }
           } else {
             TORCH_WARN("Unable to infer type of value for keyword: ", key_str);
             ivalue = at::IValue("NULL");
@@ -261,6 +287,17 @@ PyObject* RecordFunctionFast_enter(PyObject* selfGeneric, PyObject* unused) {
         kwargs[key_str] = ivalue;
       }
     }
+    auto it = kwargs.find("scope");
+    if (it != kwargs.end()) {
+      auto value = it->second;
+      if (value.isString()) {
+        auto value_str = value.toStringRef();
+        if (value_str == "user_scope") {
+          scope = at::RecordScope::USER_SCOPE;
+        }
+      }
+    }
+    self->guard = std::make_unique<at::RecordFunction>(scope);
     self->guard->before(THPUtils_unpackString(self->name), &args, &kwargs);
   }
   Py_RETURN_NONE;
@@ -325,6 +362,7 @@ void initPythonBindings(PyObject* module) {
       .value("XPU", ActivityType::XPU)
       .value("MTIA", ActivityType::MTIA)
       .value("CUDA", ActivityType::CUDA)
+      .value("HPU", ActivityType::HPU)
       .value("PrivateUse1", ActivityType::PrivateUse1);
 
   py::class_<ExperimentalConfig>(m, "_ExperimentalConfig")
@@ -334,7 +372,14 @@ void initPythonBindings(PyObject* module) {
               bool /* profiler_measure_per_kernel */,
               bool /* verbose */,
               std::vector<std::string> /* performance_events  */,
-              bool /* enable_cuda_sync_events */
+              bool /* enable_cuda_sync_events */,
+              bool /* adjust_profiler_step */,
+              bool /* disable_external_correlation*/,
+              bool /* profile_all_threads */,
+              bool /* capture_overload_names */,
+              bool /* record_python_gc_info */,
+              bool /* expose_kineto_event_metadata */,
+              std::string /* custom_profiler_config*/
               >(),
           "An experimental config for Kineto features. Please note that"
           "backward compatibility is not guaranteed.\n"
@@ -347,12 +392,27 @@ void initPythonBindings(PyObject* module) {
           "    performance_events : a list of profiler events to be used for measurement.\n"
           "    enable_cuda_sync_events : for CUDA profiling mode, enable adding CUDA synchronization events\n"
           "       that expose CUDA device, stream and event synchronization activities. This feature is new\n"
-          "       and currently disabled by default.\n",
+          "       and currently disabled by default.\n"
+          "    adjust_profiler_step (bool) : whether to adjust the profiler step to\n"
+          "       match the parent python event duration. This feature is new and currently disabled by default.\n"
+          "    disable_external_correlation (bool) : whether to disable external correlation\n"
+          "    profile_all_threads (bool) : whether to profile all threads\n"
+          "    capture_overload_names (bool) : whether to include ATen overload names in the profile\n"
+          "    record_python_gc_info (bool) : adds python gc events to profile\n"
+          "    expose_kineto_event_metadata (bool) : whether to expose KinetoEvent metadata in the PyTorch Profiler\n"
+          "    custom_profiler_config (string) : Used to pass some configurations to the custom profiler backend.\n",
           py::arg("profiler_metrics") = std::vector<std::string>(),
           py::arg("profiler_measure_per_kernel") = false,
           py::arg("verbose") = false,
           py::arg("performance_events") = std::vector<std::string>(),
-          py::arg("enable_cuda_sync_events") = false)
+          py::arg("enable_cuda_sync_events") = false,
+          py::arg("adjust_profiler_step") = false,
+          py::arg("disable_external_correlation") = false,
+          py::arg("profile_all_threads") = false,
+          py::arg("capture_overload_names") = false,
+          py::arg("record_python_gc_info") = false,
+          py::arg("expose_kineto_event_metadata") = false,
+          py::arg("custom_profiler_config") = "")
       .def(py::pickle(
           [](const ExperimentalConfig& p) { // __getstate__
             py::list py_metrics;
@@ -370,28 +430,31 @@ void initPythonBindings(PyObject* module) {
                 py_metrics,
                 p.profiler_measure_per_kernel,
                 p.verbose,
+                py_perf_events,
                 p.enable_cuda_sync_events,
-                p.performance_events);
+                p.adjust_profiler_step,
+                p.disable_external_correlation,
+                p.profile_all_threads,
+                p.capture_overload_names,
+                p.record_python_gc_info,
+                p.expose_kineto_event_metadata,
+                p.custom_profiler_config);
           },
           [](const py::tuple& t) { // __setstate__
-            if (t.size() >= 4) {
-              throw std::runtime_error("Expected atleast 4 values in state");
-            }
+            TORCH_CHECK(t.size() >= 12, "Expected at least 12 values in state");
 
             py::list py_metrics = t[0].cast<py::list>();
-            std::vector<std::string> metrics{py_metrics.size()};
-
+            std::vector<std::string> metrics;
+            metrics.reserve(py_metrics.size());
             for (const auto& py_metric : py_metrics) {
               metrics.push_back(py::str(py_metric));
             }
 
+            py::list py_perf_events = t[3].cast<py::list>();
             std::vector<std::string> performance_events;
-            if (t.size() == 5) {
-              py::list py_perf_events = t[4].cast<py::list>();
-              performance_events.resize(py_perf_events.size());
-              for (const auto& py_perf_event : py_perf_events) {
-                performance_events.push_back(py::str(py_perf_event));
-              }
+            performance_events.reserve(py_perf_events.size());
+            for (const auto& py_perf_event : py_perf_events) {
+              performance_events.push_back(py::str(py_perf_event));
             }
 
             return ExperimentalConfig(
@@ -399,19 +462,37 @@ void initPythonBindings(PyObject* module) {
                 t[1].cast<bool>(),
                 t[2].cast<bool>(),
                 std::move(performance_events),
-                t[3].cast<bool>());
+                t[4].cast<bool>(),
+                t[5].cast<bool>(),
+                t[6].cast<bool>(),
+                t[7].cast<bool>(),
+                t[8].cast<bool>(),
+                t[9].cast<bool>(),
+                t[10].cast<bool>(),
+                t[11].cast<std::string>());
           }));
 
   py::class_<ProfilerConfig>(m, "ProfilerConfig")
-      .def(py::init<
-           ProfilerState,
-           bool, /* report_input_shapes */
-           bool, /* profile_memory */
-           bool, /* with_stack */
-           bool, /* with_flops */
-           bool, /* with_modules */
-           ExperimentalConfig /* experimental_config */
-           >());
+      .def(
+          py::init<
+              ProfilerState,
+              bool, /* report_input_shapes */
+              bool, /* profile_memory */
+              bool, /* with_stack */
+              bool, /* with_flops */
+              bool, /* with_modules */
+              ExperimentalConfig /* experimental_config */,
+              std::string /* trace_id */
+              >(),
+          py::arg("state"),
+          py::arg("report_input_shapes"),
+          py::arg("profile_memory"),
+          py::arg("with_stack"),
+          py::arg("with_flops"),
+          py::arg("with_modules"),
+          py::arg("experimental_config"),
+          py::arg("trace_id") = "" // Make trace_id the only optional param
+      );
 
   py::enum_<EventType>(m, "_EventType")
       .value("TorchOp", EventType::TorchOp)
@@ -441,7 +522,7 @@ void initPythonBindings(PyObject* module) {
             return py::reinterpret_borrow<py::object>(
                 torch::autograd::utils::wrap(metadata.dtype_));
           })
-      .def_readonly("dim", &TensorMetadata::dim_)
+      .def_readonly("dim", &TensorMetadata::size_dim_)
       .def_readonly("sizes", &TensorMetadata::sizes_)
       .def_readonly("strides", &TensorMetadata::strides_);
 
@@ -458,7 +539,7 @@ void initPythonBindings(PyObject* module) {
                       [&](const c10::IValue& v) {
                         out.append(torch::jit::toPyObject(v));
                       },
-                      [&](const c10::nullopt_t&) { out.append(py::none()); },
+                      [&](const std::nullopt_t&) { out.append(py::none()); },
                       [&](const auto& v) { out.append(py::cast(v)); }),
                   input);
             }
@@ -539,6 +620,7 @@ void initPythonBindings(PyObject* module) {
 
   py::class_<Result, std::shared_ptr<Result>>(m, "_ProfilerEvent")
       .def_property_readonly("name", &Result::name)
+      .def_property_readonly("overload_name", &Result::overload_name)
       .def_property_readonly("tag", &Result::tag)
       .def_readonly("extra_fields", &Result::extra_fields_)
       .def_property_readonly(
@@ -642,7 +724,8 @@ void initPythonBindings(PyObject* module) {
   };
 
   static PyTypeObject RecordFunctionFast_Type = {
-      PyVarObject_HEAD_INIT(nullptr, 0)};
+      PyVarObject_HEAD_INIT(nullptr, 0)
+  };
 
   RecordFunctionFast_Type.tp_name = "torch._C._profiler.RecordFunctionFast",
   RecordFunctionFast_Type.tp_basicsize = sizeof(RecordFunctionFast);

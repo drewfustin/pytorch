@@ -23,8 +23,6 @@ Tensor& max_unpooling2d_forward_out_cpu(
   // Nondeterministic with duplicate indices
   at::globalContext().alertNotDeterministic("max_unpooling2d_forward_out");
 
-  auto oheight = output_size[0];
-  auto owidth = output_size[1];
   TORCH_CHECK(
       indices_.scalar_type() == at::ScalarType::Long,
       "elements in indices should be type int64 but got: ", indices_.scalar_type());
@@ -45,6 +43,9 @@ Tensor& max_unpooling2d_forward_out_cpu(
                 self_.sizes(), " with dimension ", i , " being empty.");
   }
 
+  auto oheight = output_size[0];
+  auto owidth = output_size[1];
+
   auto memory_format = self_.suggest_memory_format();
   auto self = self_.contiguous(memory_format);
   auto indices = indices_.contiguous(memory_format);
@@ -64,7 +65,7 @@ Tensor& max_unpooling2d_forward_out_cpu(
   }
 
   return output;
-};
+}
 
 Tensor max_unpooling2d_forward_cpu(
     const Tensor& self,
@@ -136,7 +137,7 @@ static void max_unpooling3d_shape_check(
   if (gradOutput.defined()) {
     if (oT != gradOutput.size(dimt) || oH != gradOutput.size(dimh) ||
         oW != gradOutput.size(dimw)) {
-      AT_ERROR(
+      TORCH_CHECK(false,
           "Inconsistent gradOutput size. oT= ",
           oT,
           ", oH= ",

@@ -47,10 +47,14 @@ TORCH_META_FUNC(nll_loss_forward)
   TORCH_CHECK(
       target.dim() <= 1,
       "0D or 1D target tensor expected, multi-target not supported");
-
-  auto no_batch_dim = self.dim() == 1  && target.dim() == 0;
+  if (self.dim() == 1 && target.dim() == 1) {
+      TORCH_CHECK_VALUE(
+          target.size(0) == 1,
+          "For 1D input, 1D target must have size 1, but got target size: ",
+          target.size(0));
+  }
   TORCH_CHECK(
-      no_batch_dim || (self.size(0) == target.size(0)),
+      self.dim() == 1 || (self.size(0) == target.size(0)),
       "size mismatch (got input: ",
       self.sizes(),
       ", target: ",
@@ -147,7 +151,7 @@ inline Tensor optional_contiguous(const Tensor& source) {
 // or nullptr if the tensor is undefined.
 template <typename scalar_t>
 inline scalar_t* optional_data(const Tensor& source) {
-  if constexpr (std::is_const<scalar_t>::value) {
+  if constexpr (std::is_const_v<scalar_t>) {
     return source.defined() ? source.const_data_ptr<scalar_t>() : nullptr;
   } else {
     return source.defined() ? source.data_ptr<scalar_t>() : nullptr;
@@ -155,7 +159,7 @@ inline scalar_t* optional_data(const Tensor& source) {
 }
 
 template <typename scalar_t, typename target_t>
-static void nll_loss_out_frame(
+void nll_loss_out_frame(
     const Tensor& output,
     const Tensor& total_weight,
     const Tensor& input,
@@ -231,7 +235,7 @@ static void nll_loss_out_frame(
 
   constexpr int64_t cascade_sum_num_levels = 8;
   const int64_t level_power =
-      std::max(int64_t(4), utils::CeilLog2(batch_size) / cascade_sum_num_levels);
+      std::max(static_cast<int64_t>(4), utils::CeilLog2(batch_size) / cascade_sum_num_levels);
   const int64_t level_step = (1 << level_power);
   const int64_t level_mask = level_step - 1;
 
@@ -334,7 +338,7 @@ void nll_loss_forward_out_cpu_template(
 }
 
 template <typename scalar_t, typename target_t>
-static void nll_loss_backward_out_frame(
+void nll_loss_backward_out_frame(
     const Tensor& grad_input,
     const Tensor& grad_output,
     const Tensor& input,
@@ -659,20 +663,12 @@ Tensor cross_entropy_loss_symint(
 }
 
 Tensor & nll_loss_out(const Tensor & self, const Tensor & target, const std::optional<Tensor>& weight_opt, int64_t reduction, int64_t ignore_index, Tensor & output) {
-  // See [Note: hacky wrapper removal for optional tensor]
-  c10::MaybeOwned<Tensor> weight_maybe_owned = at::borrow_from_optional_tensor(weight_opt);
-  const Tensor& weight = *weight_maybe_owned;
-
   Tensor total_weight = at::empty({0}, self.options());
-  return std::get<0>(at::nll_loss_forward_out(output, total_weight, self, target, weight, reduction, ignore_index));
+  return std::get<0>(at::nll_loss_forward_out(output, total_weight, self, target, weight_opt, reduction, ignore_index));
 }
 
 Tensor nll_loss_symint(const Tensor & self, const Tensor & target, const std::optional<Tensor>& weight_opt, int64_t reduction, c10::SymInt ignore_index) {
-  // See [Note: hacky wrapper removal for optional tensor]
-  c10::MaybeOwned<Tensor> weight_maybe_owned = at::borrow_from_optional_tensor(weight_opt);
-  const Tensor& weight = *weight_maybe_owned;
-
-  return std::get<0>(at::nll_loss_forward_symint(self, target, weight, reduction, std::move(ignore_index)));
+  return std::get<0>(at::nll_loss_forward_symint(self, target, weight_opt, reduction, std::move(ignore_index)));
 }
 
 Tensor nll_loss_nd_symint(

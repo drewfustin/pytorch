@@ -1,4 +1,3 @@
-#include <ATen/ATen.h>
 #include <ATen/CachedTensorUtils.h>
 
 #include <c10/util/flat_hash_map.h>
@@ -8,12 +7,12 @@ namespace at::caching {
 
 using weakref_type = c10::weak_intrusive_ptr<TensorImpl, UndefinedTensorImpl>;
 
-bool cached_tensorimpls_enabled = false;
+static bool cached_tensorimpls_enabled = false;
 
 // Like `cached_casts` in autocast_mode, we hash on the TensorImpl*
 //  and keep the pointer alive with a weakref value.
-ska::flat_hash_map<TensorImpl*, weakref_type> cached_tensorimpls;
-std::mutex cached_tensorimpl_mutex;
+static ska::flat_hash_map<TensorImpl*, weakref_type> cached_tensorimpls;
+static std::mutex cached_tensorimpl_mutex;
 
 
 bool is_cached_tensor(const at::Tensor& t) {

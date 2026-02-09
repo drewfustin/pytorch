@@ -1,16 +1,17 @@
 # Owner(s): ["module: dynamo"]
 
-import unittest
+import os
+from unittest.mock import patch
 
 import torch
-
-from functorch import make_fx
+import torch._dynamo
+import torch._dynamo.config
 from torch._dynamo import debug_utils
-from torch._dynamo.debug_utils import aot_graph_input_parser
+from torch._dynamo.debug_utils import aot_graph_input_parser, generate_env_vars_string
 from torch._dynamo.test_case import TestCase
-from torch.testing._internal.inductor_utils import HAS_CUDA
+from torch.fx.experimental.proxy_tensor import make_fx
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 
-requires_cuda = unittest.skipUnless(HAS_CUDA, "requires cuda")
 
 f32 = torch.float32
 i64 = torch.int64
@@ -45,7 +46,7 @@ def forward(self, x_1):
     """,  # NOQA: B950
         )
 
-        fp64_model, fp64_examples = debug_utils.cast_to_fp64(fx, (x,))
+        _, fp64_examples = debug_utils.cast_to_fp64(fx, (x,))
         self.assertEqual(fp64_examples, (x.to(torch.float64),))
 
         self.assertExpectedInline(
@@ -60,10 +61,46 @@ def forward(self, x_1):
     """,  # NOQA: B950
         )
 
-    @requires_cuda
-    def test_aot_graph_parser(self):
-        from torch import device
+    @patch.dict(
+        os.environ,
+        {
+            "TORCHINDUCTOR_MAX_AUTOTUNE": "1",
+            "TEST_ENV": "1",
+            "TORCHINDUCTOR_ENV_SINGLE_QUOTES": "inductor_'env'",
+            "TORCHINDUCTOR_ENV_DOUBLE_QUOTES": 'inductor_"env"',
+        },
+    )
+    def test_generate_env_vars_string(self):
+        env_strings = generate_env_vars_string()
+        self.assertIn(
+            """os.environ['TORCHINDUCTOR_MAX_AUTOTUNE'] = '1'
+""",
+            env_strings,
+        )
+        self.assertIn(
+            """os.environ['TORCHINDUCTOR_ENV_SINGLE_QUOTES'] = 'inductor_"env"'
+""",
+            env_strings,
+        )
+        self.assertIn(
+            """os.environ['TORCHINDUCTOR_ENV_DOUBLE_QUOTES'] = 'inductor_"env"'
+""",
+            env_strings,
+        )
+        self.assertIn(
+            """import os
+""",
+            env_strings,
+        )
+        self.assertNotIn(
+            """TEST_ENV
+""",
+            env_strings,
+        )
 
+
+class TestDebugUtilsDevice(TestCase):
+    def test_aot_graph_parser(self, device):
         def forward(
             self,
             primals_1: "f32[1001, 6]",
@@ -79,7 +116,7 @@ def forward(self, x_1):
                 _tensor_constant0
             )
             _tensor_constant0 = None
-            index: "f32[6144, 4190]" = torch.ops.aten.index.Tensor(
+            index: "f32[6144, 4190]" = torch.ops.aten.index.Tensor(  # noqa: F841
                 primals_48, [None, lift_fresh_copy]
             )
             lift_fresh_copy = None
@@ -112,7 +149,7 @@ def forward(self, x_1):
                 1,
                 dtype=torch.int32,
                 layout=torch.strided,
-                device=device(type="cuda", index=0),
+                device=device,
                 pin_memory=False,
             )
 
@@ -121,7 +158,7 @@ def forward(self, x_1):
                 start=0,
                 step=1,
                 dtype=torch.int32,
-                device=device(type="cuda"),
+                device=device,
                 requires_grad=False,
             )
 
@@ -133,7 +170,7 @@ def forward(self, x_1):
                 start=0,
                 step=1001,
                 dtype=torch.int32,
-                device=device(type="cuda", index=0),
+                device=device,
                 requires_grad=False,
             )
             view: "i32[6150144]" = torch.ops.aten.reshape.default(mul, [-1])
@@ -146,12 +183,11 @@ def forward(self, x_1):
 
             return _embedding_bag
 
-        kwargs = aot_graph_input_parser(forward, device="cuda")
+        kwargs = aot_graph_input_parser(forward, device=device)
         # runs successfully
         forward(**kwargs)
 
-    @requires_cuda
-    def test_sym_aot_graph_parser(self):
+    def test_sym_aot_graph_parser(self, device):
         def forward(
             self,
             primals_1: "f32[1001, 6]",  # noqa: F821
@@ -163,7 +199,7 @@ def forward(self, x_1):
             _tensor_constant0: "i64[4190]" = self._tensor_constant0
 
         kwargs = aot_graph_input_parser(
-            forward, device="cuda", sym_shapes={"s0": 10}, default_sym_shape=5
+            forward, device=device, sym_shapes={"s0": 10}, default_sym_shape=5
         )
 
         self.assertEqual(list(kwargs["primals_2"].shape), [10])
@@ -171,6 +207,119 @@ def forward(self, x_1):
 
         self.assertEqual(list(kwargs["primals_4"].shape), [5])
         self.assertEqual(kwargs["primals_5"], 5)
+
+
+instantiate_device_type_tests(TestDebugUtils, globals())
+
+devices = ["cuda", "hpu"]
+instantiate_device_type_tests(TestDebugUtilsDevice, globals(), only_for=devices)
+
+
+class TestBackendOverrideIntegration(TestCase):
+    def setUp(self):
+        super().setUp()
+        torch._dynamo.reset()
+        self._backends_called = []
+
+    def tearDown(self):
+        torch._dynamo.reset()
+        super().tearDown()
+
+    def _fn_with_4_graphs(self, x):
+        x = x + 1
+        torch._dynamo.graph_break()
+        x = x * 2
+        torch._dynamo.graph_break()
+        x = x - 1
+        torch._dynamo.graph_break()
+        x = x / 2
+        return x
+
+    def _run_with_override(self, device, override_config, default_backend="eager"):
+        from torch._dynamo.graph_id_filter import lookup_backend_with_mode
+
+        torch._dynamo.reset()
+        self._backends_called.clear()
+        original_lookup = lookup_backend_with_mode
+
+        def tracking_lookup(backend_str):
+            self._backends_called.append(backend_str)
+            return original_lookup(backend_str)
+
+        with (
+            patch.object(
+                torch._dynamo.config, "debug_backend_override", override_config
+            ),
+            patch(
+                "torch._dynamo.graph_id_filter.lookup_backend_with_mode",
+                tracking_lookup,
+            ),
+        ):
+            compiled_fn = torch.compile(self._fn_with_4_graphs, backend=default_backend)
+            compiled_fn(torch.randn(10, device=device))
+
+        return self._backends_called.copy()
+
+    def test_no_override(self, device):
+        result = self._run_with_override(device, "")
+        self.assertEqual(result, [])
+
+    def test_override_all_graphs(self, device):
+        result = self._run_with_override(device, ">=0:aot_eager")
+        self.assertEqual(result, ["aot_eager", "aot_eager", "aot_eager", "aot_eager"])
+
+    def test_override_greater_than(self, device):
+        result = self._run_with_override(device, ">0:eager")
+        self.assertEqual(result, ["eager", "eager", "eager"])
+
+    def test_override_less_than(self, device):
+        result = self._run_with_override(device, "<2:aot_eager")
+        self.assertEqual(result, ["aot_eager", "aot_eager"])
+
+    def test_override_less_or_equal(self, device):
+        result = self._run_with_override(device, "<=1:aot_eager")
+        self.assertEqual(result, ["aot_eager", "aot_eager"])
+
+    def test_override_single_id(self, device):
+        result = self._run_with_override(device, "1:aot_eager")
+        self.assertEqual(result, ["aot_eager"])
+
+    def test_override_multiple_ids(self, device):
+        result = self._run_with_override(device, "0,2:aot_eager")
+        self.assertEqual(result, ["aot_eager", "aot_eager"])
+
+    def test_override_range(self, device):
+        result = self._run_with_override(device, "1-2:eager")
+        self.assertEqual(result, ["eager", "eager"])
+
+    def test_multiple_rules(self, device):
+        result = self._run_with_override(device, "0:aot_eager;1:inductor;3:eager")
+        self.assertEqual(result, ["aot_eager", "inductor", "eager"])
+
+    def test_first_rule_wins(self, device):
+        result = self._run_with_override(device, ">=0:aot_eager;>=1:inductor")
+        self.assertEqual(result, ["aot_eager", "aot_eager", "aot_eager", "aot_eager"])
+
+    def test_complex_config(self, device):
+        result = self._run_with_override(device, "0:aot_eager;>=2:inductor")
+        self.assertEqual(result, ["aot_eager", "inductor", "inductor"])
+
+    def test_inductor_with_mode(self, device):
+        result = self._run_with_override(device, ">=0:inductor:reduce-overhead")
+        self.assertEqual(
+            result,
+            [
+                "inductor:reduce-overhead",
+                "inductor:reduce-overhead",
+                "inductor:reduce-overhead",
+                "inductor:reduce-overhead",
+            ],
+        )
+
+
+instantiate_device_type_tests(
+    TestBackendOverrideIntegration, globals(), only_for=["cpu", "cuda"]
+)
 
 
 if __name__ == "__main__":

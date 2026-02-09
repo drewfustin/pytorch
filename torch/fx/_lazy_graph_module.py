@@ -1,14 +1,16 @@
 # mypy: allow-untyped-defs
 from contextlib import contextmanager
 
-from torch.fx import GraphModule
 from torch.fx.graph_module import (
     _format_import_block,
+    GraphModule,
     reduce_graph_module,
     reduce_package_graph_module,
 )
 from torch.package import PackageExporter, sys_importer
+
 from ._compatibility import compatibility
+
 
 _use_lazy_graph_module_flag = False
 _force_skip_lazy_graph_module_flag = False
@@ -116,7 +118,8 @@ class _LazyGraphModule(GraphModule):
         # Calling self.real_recompile can make sure we skip recompilation if
         # we have already done so.
         self.real_recompile()
-        assert not self._needs_recompile()
+        if self._needs_recompile():
+            raise AssertionError("Recompilation required after real_recompile()")
 
         # call `__call__` rather than 'forward' since recompilation may
         # install a wrapper for `__call__` to provide a customized error
@@ -124,11 +127,6 @@ class _LazyGraphModule(GraphModule):
         return self(*args, **kwargs)
 
     forward = _lazy_forward
-
-    # TODO: we shold handle __reduce_deploy__ the same way as __reduce_package__,
-    # or __reduce__ by calling _real_recompile. But I don't find a good way
-    # to test __reduce_deploy__ out. Also it's very unlikely that LazyGraphModule
-    # will be used in torch::deploy. So it's skipped for now.
 
     def __reduce_package__(self, exporter: PackageExporter):
         """

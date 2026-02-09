@@ -9,12 +9,6 @@
 
 namespace c10::cuda {
 
-using CaptureId_t = unsigned long long;
-
-// first is set if the instance is created by CUDAGraph::capture_begin.
-// second is set if the instance is created by at::cuda::graph_pool_handle.
-using MempoolId_t = std::pair<CaptureId_t, CaptureId_t>;
-
 // RAII guard for "cudaStreamCaptureMode", a thread-local value
 // that controls the error-checking strictness of a capture.
 struct C10_CUDA_API CUDAStreamCaptureModeGuard {
@@ -22,6 +16,11 @@ struct C10_CUDA_API CUDAStreamCaptureModeGuard {
       : strictness_(desired) {
     C10_CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&strictness_));
   }
+  CUDAStreamCaptureModeGuard(const CUDAStreamCaptureModeGuard&) = delete;
+  CUDAStreamCaptureModeGuard(CUDAStreamCaptureModeGuard&&) = delete;
+  CUDAStreamCaptureModeGuard& operator=(const CUDAStreamCaptureModeGuard&) =
+      delete;
+  CUDAStreamCaptureModeGuard& operator=(CUDAStreamCaptureModeGuard&&) = delete;
   ~CUDAStreamCaptureModeGuard() {
     C10_CUDA_CHECK_WARN(cudaThreadExchangeStreamCaptureMode(&strictness_));
   }

@@ -8,7 +8,6 @@
 #include <c10/util/flat_hash_map.h>
 #include <c10/util/irange.h>
 #include <c10/util/overloaded.h>
-
 #include <torch/csrc/profiler/api.h>
 #include <torch/csrc/profiler/collection.h>
 #include <torch/csrc/profiler/containers.h>
@@ -21,12 +20,11 @@
 #include <torch/csrc/profiler/standalone/privateuse1_observer.h>
 #include <torch/csrc/profiler/util.h>
 
-#include <ATen/Context.h>
-
 #include <stdexcept>
 #include <utility>
 
 #ifdef USE_KINETO
+#include <ApproximateClock.h>
 #include <libkineto.h>
 #include <time_since_epoch.h>
 
@@ -39,7 +37,8 @@ extern "C" {
 // https://github.com/pytorch/pytorch/issues/51026
 __attribute__((weak)) int acc_get_device_type();
 __attribute__((weak)) int acc_get_device_type() {
-  throw std::runtime_error(
+  TORCH_CHECK(
+      false,
       "Dummy implementation of acc_get_device_type is not supposed to be called!");
 }
 } // extern "C"
@@ -63,6 +62,7 @@ using torch::profiler::impl::EventType;
 using torch::profiler::impl::ExtraFields;
 using torch::profiler::impl::get_record_concrete_inputs_enabled;
 using torch::profiler::impl::ivalueListToStr;
+using torch::profiler::impl::ivalueToStr;
 using torch::profiler::impl::op_input_t;
 using torch::profiler::impl::ProfilerStateBase;
 using torch::profiler::impl::PyExtraFieldsBase;
@@ -73,6 +73,27 @@ using torch::profiler::impl::stacksToStr;
 using torch::profiler::impl::strListToStr;
 using torch::profiler::impl::TensorMetadata;
 using torch::profiler::impl::variantShapesToStr;
+
+// Helper function to check if ProfilerState is a Kineto-compatible state
+inline bool isKinetoCompatibleState(ProfilerState state) {
+  return state == ProfilerState::KINETO ||
+      state == ProfilerState::KINETO_GPU_FALLBACK ||
+      state == ProfilerState::KINETO_PRIVATEUSE1_FALLBACK;
+}
+
+// Helper function to check if ProfilerState is valid for disabling profiler
+inline bool isValidDisableState(ProfilerState state) {
+  return isKinetoCompatibleState(state) ||
+      state == ProfilerState::KINETO_ONDEMAND || state == ProfilerState::NVTX ||
+      state == ProfilerState::ITT || state == ProfilerState::PRIVATEUSE1;
+}
+
+// Helper function to check if ProfilerState uses an external tracer
+// (NVTX/ITT/PRIVATEUSE1 - these use their own tracing callbacks, not Kineto)
+inline bool isExternalTracerState(ProfilerState state) {
+  return state == ProfilerState::NVTX || state == ProfilerState::ITT ||
+      state == ProfilerState::PRIVATEUSE1;
+}
 
 struct OpArgData {
   bool hasData;
@@ -222,7 +243,7 @@ struct AddTensorboardFields : public MetadataBase {
   }
 
   template <typename T>
-  void operator()(const T&) {}
+  void operator()(const T& /*unused*/) {}
 };
 
 struct AddGenericMetadata : public MetadataBase {
@@ -257,6 +278,47 @@ struct AddGenericMetadata : public MetadataBase {
       }
     }
 
+    // Add metadata for kwinputs if exist
+    for (const auto& [key, val] : op_event.kwinputs_) {
+      if (key == "stream" && !val.isInt()) {
+        LOG(WARNING) << "Inputted stream is not an int for op: "
+                     << op_event.name_ << " skipping";
+        continue;
+      }
+
+      // Until needed, lets limit the kwargs to only ints, doubles, strings,
+      // bools, and list of strings
+      bool isValidType =
+          val.isInt() || val.isDouble() || val.isString() || val.isBool();
+      bool isStringList = false;
+
+      if (!isValidType && val.isList()) {
+        // Check if it's a list of strings
+        auto list = val.toListRef();
+        isStringList =
+            std::all_of(list.begin(), list.end(), [](const c10::IValue& item) {
+              return item.isString();
+            });
+      }
+
+      if (!isValidType && !isStringList) {
+        LOG(WARNING)
+            << "Inputted kwarg: " << key
+            << " is not an int, double, string, bool, or list of strings for op: "
+            << op_event.name_ << " skipping";
+        continue;
+      }
+
+      if (isStringList) {
+        // For list of strings, use ivalueListToStr
+        auto list = val.toListRef();
+        std::vector<c10::IValue> stringList(list.begin(), list.end());
+        addMetadata(key, ivalueListToStr(stringList));
+      } else {
+        bool isString = val.isString();
+        addMetadata(key, ivalueToStr(val, isString));
+      }
+    }
     // Add extra metadata if any
     for (const auto& [key, val] : op_event.extra_meta_) {
       addMetadata(key, val);
@@ -305,7 +367,7 @@ struct AddGenericMetadata : public MetadataBase {
   }
 
   template <typename T>
-  void operator()(const T&) {}
+  void operator()(const T& /*unused*/) {}
 
  private:
   /* To get names of the performance events */
@@ -378,6 +440,14 @@ struct KinetoThreadLocalState : public ProfilerStateBase {
     eventPostProcessCb = std::move(cb);
   }
 
+  void pausePython() {
+    recordQueue.stop();
+  }
+
+  void resumePython() {
+    recordQueue.restart();
+  }
+
   std::unique_ptr<torch::profiler::impl::kineto::ActivityTraceWrapper>
   finalizeTrace() {
     auto end_time = getTimeNs();
@@ -385,6 +455,9 @@ struct KinetoThreadLocalState : public ProfilerStateBase {
 
     std::lock_guard<std::mutex> guard(state_mutex_);
     auto converter = clockConverter.makeConverter();
+#ifdef USE_KINETO
+    libkineto::get_time_converter() = converter;
+#endif
     auto records_and_trace =
         recordQueue.getRecords(std::move(converter), startTime, end_time);
 
@@ -470,6 +543,15 @@ void onFunctionExit(
   }
   kineto_ctx_ptr->event_->basic_fields_.end_tid_ =
       at::RecordFunction::currentThreadId();
+  if (fn.isNcclMeta()) {
+    auto& extra_meta = *(kineto_ctx_ptr->event_->extra_nccl_meta_);
+    // Record only the outputs in this exit callback of the record function
+    torch::profiler::impl::SaveNcclMetaConfig ncclMetaConfig{
+        true, false, false, true};
+    auto additional_nccl_meta =
+        torch::profiler::impl::saveNcclMeta(fn, ncclMetaConfig);
+    extra_meta.insert(additional_nccl_meta.begin(), additional_nccl_meta.end());
+  }
   if (config.state == ProfilerState::KINETO_GPU_FALLBACK) {
     try {
       auto fallback = kineto_ctx_ptr->fallback_;
@@ -486,10 +568,12 @@ void onFunctionExit(
         nullptr, &fallback->device_event_end_, nullptr);
   }
 
-  if (fn.scope() == at::RecordScope::USER_SCOPE) {
-    torch::profiler::impl::kineto::popUserCorrelationId();
-  } else {
-    torch::profiler::impl::kineto::popCorrelationId();
+  if (!config.experimental_config.disable_external_correlation) {
+    if (fn.scope() == at::RecordScope::USER_SCOPE) {
+      torch::profiler::impl::kineto::popUserCorrelationId();
+    } else {
+      torch::profiler::impl::kineto::popCorrelationId();
+    }
   }
 }
 
@@ -513,6 +597,12 @@ void pushProfilingCallbacks(const std::unordered_set<at::RecordScope>& scopes) {
         at::addThreadLocalCallback(recordFunctionCallback));
   }
 }
+
+struct ProfilerStateInfo {
+  std::shared_ptr<KinetoThreadLocalState> state_ptr;
+  std::unordered_set<at::RecordScope> scopes;
+};
+std::shared_ptr<ProfilerStateInfo> profiler_state_info_ptr{nullptr};
 
 } // namespace
 
@@ -556,16 +646,15 @@ void prepareProfiler(
     return;
   }
   TORCH_CHECK(
-      config.state == ProfilerState::KINETO ||
-          config.state == ProfilerState::KINETO_GPU_FALLBACK ||
-          config.state == ProfilerState::KINETO_PRIVATEUSE1_FALLBACK,
+      isKinetoCompatibleState(config.state),
       "Supported only in Kineto profiler");
   torch::profiler::impl::kineto::prepareTrace(
       /*cpuOnly=*/!(
           at::hasCUDA() || at::hasXPU() || at::hasMTIA() ||
           c10::get_privateuse1_backend() != "privateuseone"),
       activities,
-      config.experimental_config);
+      config.experimental_config,
+      config.trace_id);
 
   if (!config.experimental_config.performance_events.empty()) {
     /* For now only CPU activity is supported */
@@ -575,7 +664,7 @@ void prepareProfiler(
     /*
      * Sending a warning and passing the non-standard event to the backend
      * Backend can abort if the event is not supported.
-     * TODO Should we gracefully drop the invalid event if we have atleast one
+     * TODO Should we gracefully drop the invalid event if we have at least one
      * valid?
      */
     auto is_standard_event = [](const std::string& event) -> bool {
@@ -591,6 +680,80 @@ void prepareProfiler(
       if (!is_standard_event(e)) {
         TORCH_WARN("Forwarding a non-standard CPU performance event : ", e);
       }
+    }
+  }
+}
+
+static void toggleTorchOpCollectionDynamic(bool enable) {
+  auto state_ptr = ProfilerStateBase::get();
+  if (state_ptr) {
+    const auto& config = state_ptr->config();
+    if (enable) {
+      auto scopes = profiler_state_info_ptr->scopes;
+      config.global() ? pushProfilingCallbacks</*global=*/true>(scopes)
+                      : pushProfilingCallbacks</*global=*/false>(scopes);
+    } else {
+      state_ptr->removeCallback();
+    }
+  }
+}
+
+// Set this function to be unused as profiler implementation needs more
+// refactoring to support Python ops collection dynamic toggling
+#ifdef _MSC_VER
+#define UNUSED
+#else
+#define UNUSED __attribute__((unused))
+#endif
+static UNUSED void togglePythonCollectionDynamic(bool enable) {
+  auto state_ptr = ProfilerStateBase::get();
+  if (state_ptr) {
+    auto global = state_ptr->config().global();
+    KinetoThreadLocalState* kineto_thread_local_state_ptr =
+        KinetoThreadLocalState::get(global);
+    if (enable) {
+      kineto_thread_local_state_ptr->resumePython();
+    } else {
+      kineto_thread_local_state_ptr->pausePython();
+    }
+  }
+}
+
+static void toggleCPUCollectionDynamic(bool enable) {
+  toggleTorchOpCollectionDynamic(enable);
+  // For now we only support Torch Op collection dynamic toggling as
+  // implementing Python ops would require not only string parsing to get rid of
+  // the toggling events as well as other unfinished events as well as changes
+  // in stack logic
+  // togglePythonCollectionDynamic(enable);
+}
+
+void toggleCollectionDynamic(
+    const bool enable,
+    const std::set<torch::profiler::impl::ActivityType>& activities) {
+  if (activities.count(torch::autograd::profiler::ActivityType::CPU) > 0 &&
+      (activities.count(torch::autograd::profiler::ActivityType::CUDA) == 0 ||
+       activities.count(torch::autograd::profiler::ActivityType::XPU) == 0)) {
+    LOG(WARNING)
+        << "Toggling CPU activity with GPU activity on may result in traces with GPU events on arbitrary tracks";
+  } else if (
+      (activities.count(torch::autograd::profiler::ActivityType::CUDA) > 0 ||
+       activities.count(torch::autograd::profiler::ActivityType::XPU) > 0) &&
+      activities.count(torch::autograd::profiler::ActivityType::CPU) == 0) {
+    LOG(WARNING)
+        << "Toggling GPU activity with CPU activity on may result in traces with incorrect correlation between CPU and GPU events";
+  }
+  for (auto act : activities) {
+    if (act == torch::autograd::profiler::ActivityType::CUDA ||
+        act == torch::autograd::profiler::ActivityType::XPU) {
+      torch::profiler::impl::kineto::toggleCollectionDynamic(enable);
+    } else if (act == torch::autograd::profiler::ActivityType::CPU) {
+      toggleCPUCollectionDynamic(enable);
+    } else {
+      LOG(WARNING)
+          << "Dynamic toggle is only supported for CPU/GPU activity, skipping toggling of "
+          << actToString(act);
+      continue;
     }
   }
 }
@@ -625,58 +788,88 @@ void enableProfiler(
       "Profiler is already enabled",
       (config.global() ? "." : " on this thread."));
 
-  if (config.state == ProfilerState::NVTX) {
-    torch::profiler::impl::pushNVTXCallbacks(config, scopes);
-    return;
-  } else if (config.state == ProfilerState::ITT) {
-    torch::profiler::impl::pushITTCallbacks(config, scopes);
-    return;
-  } else if (config.state == ProfilerState::PRIVATEUSE1) {
-    torch::profiler::impl::pushPRIVATEUSE1CallbacksStub(config, scopes);
+  // Handle external tracer states - these use their own tracing callbacks
+  if (isExternalTracerState(config.state)) {
+    switch (config.state) {
+      case ProfilerState::NVTX:
+        torch::profiler::impl::pushNVTXCallbacks(config, scopes);
+        break;
+      case ProfilerState::ITT:
+        torch::profiler::impl::pushITTCallbacks(config, scopes);
+        break;
+      case ProfilerState::PRIVATEUSE1:
+        torch::profiler::impl::pushPRIVATEUSE1CallbacksStub(config, scopes);
+        break;
+      default:
+        break;
+    }
     return;
   }
 
-  TORCH_CHECK(
-      config.state == ProfilerState::KINETO ||
-      config.state == ProfilerState::KINETO_GPU_FALLBACK ||
-      config.state == ProfilerState::KINETO_PRIVATEUSE1_FALLBACK ||
-      config.global());
+  TORCH_CHECK(isKinetoCompatibleState(config.state) || config.global());
   TORCH_CHECK(!activities.empty(), "No activities specified.");
   TORCH_INTERNAL_ASSERT(
       has_cpu || !config.global(),
       "Ondemand profiling must enable CPU tracing");
 
-  KinetoThreadLocalState::push(
-      std::make_shared<KinetoThreadLocalState>(config, activities));
+  auto state_ptr = std::make_shared<KinetoThreadLocalState>(config, activities);
+  KinetoThreadLocalState::push(state_ptr);
 
   if (has_cpu) {
-    config.global() ? pushProfilingCallbacks</*global=*/true>(scopes)
-                    : pushProfilingCallbacks</*global=*/false>(scopes);
+    config.pushGlobalCallbacks()
+        ? pushProfilingCallbacks</*global=*/true>(scopes)
+        : pushProfilingCallbacks</*global=*/false>(scopes);
   }
 
   if (!config.global()) {
     torch::profiler::impl::kineto::startTrace();
   }
+
+  if (has_cpu) {
+    auto state_info_ptr = std::make_shared<ProfilerStateInfo>();
+    state_info_ptr->state_ptr = state_ptr;
+    state_info_ptr->scopes = scopes;
+    profiler_state_info_ptr = state_info_ptr;
+  }
+}
+
+bool isProfilerEnabledInMainThread() {
+  return profiler_state_info_ptr != nullptr;
+}
+
+void enableProfilerInChildThread() {
+  auto state_info_ptr = profiler_state_info_ptr;
+  TORCH_CHECK(state_info_ptr, "Profiler is not enabled in main thread.");
+  TORCH_CHECK(
+      KinetoThreadLocalState::get(/*global=*/false) == nullptr,
+      "Profiler is already enabled in this thread.");
+
+  KinetoThreadLocalState::push(state_info_ptr->state_ptr);
+  pushProfilingCallbacks</*global=*/false>(state_info_ptr->scopes);
+}
+
+void disableProfilerInChildThread() {
+  auto state_ptr = ProfilerStateBase::pop();
+  TORCH_CHECK(
+      state_ptr,
+      "Can't disable Kineto profiler when it's not running in this thread");
+  state_ptr->removeCallback();
 }
 
 std::unique_ptr<ProfilerResult> disableProfiler() {
+  // releasing to inform child threads to stop profiling
+  profiler_state_info_ptr = nullptr;
+
   auto state_ptr = ProfilerStateBase::pop();
   const auto& config = state_ptr->config();
   TORCH_CHECK(
-      state_ptr &&
-          (config.state == ProfilerState::KINETO ||
-           config.state == ProfilerState::KINETO_GPU_FALLBACK ||
-           config.state == ProfilerState::KINETO_PRIVATEUSE1_FALLBACK ||
-           config.state == ProfilerState::KINETO_ONDEMAND ||
-           config.state == ProfilerState::NVTX ||
-           config.state == ProfilerState::ITT ||
-           config.state == ProfilerState::PRIVATEUSE1),
+      state_ptr && isValidDisableState(config.state),
       "Can't disable Kineto profiler when it's not running");
 
   state_ptr->removeCallback();
 
   // Traces are converged via libkineto automatically for ondemand flow
-  if (state_ptr->config().global()) {
+  if (config.global()) {
     (void)std::static_pointer_cast<KinetoThreadLocalState>(state_ptr)
         ->finalizeTrace();
     return std::make_unique<ProfilerResult>();
@@ -685,14 +878,12 @@ std::unique_ptr<ProfilerResult> disableProfiler() {
   // Shared among NVTX, PRIVATEUSE1, KINETO, KINETO_GPU_FALLBACK,
   // KINETO_PRIVATEUSE1_FALLBACK
   std::unique_ptr<ProfilerResult> result;
-  if (state_ptr->config().state == ProfilerState::NVTX ||
-      state_ptr->config().state == ProfilerState::PRIVATEUSE1) {
+  if (config.state == ProfilerState::NVTX ||
+      config.state == ProfilerState::PRIVATEUSE1) {
     result = std::make_unique<ProfilerResult>();
   }
 
-  if (config.state == ProfilerState::KINETO ||
-      config.state == ProfilerState::KINETO_GPU_FALLBACK ||
-      config.state == ProfilerState::KINETO_PRIVATEUSE1_FALLBACK) {
+  if (isKinetoCompatibleState(config.state)) {
     auto kineto_state_ptr =
         std::static_pointer_cast<KinetoThreadLocalState>(state_ptr);
     auto trace = kineto_state_ptr->finalizeTrace();
@@ -704,6 +895,22 @@ std::unique_ptr<ProfilerResult> disableProfiler() {
   }
 
   return result;
+}
+namespace tracer = torch::profiler::impl::python_tracer;
+static std::unique_ptr<tracer::PythonMemoryTracerBase> memory_tracer;
+void startMemoryProfile() {
+  if (memory_tracer == nullptr) {
+    memory_tracer = tracer::PythonMemoryTracerBase::make();
+  }
+  memory_tracer->start();
+}
+
+void stopMemoryProfile() {
+  memory_tracer->stop();
+}
+
+void exportMemoryProfile(const std::string& filename) {
+  memory_tracer->export_memory_history(filename);
 }
 
 KinetoEvent::KinetoEvent(
@@ -727,6 +934,7 @@ KinetoEvent::KinetoEvent(
     shapes_ = std::move(arg_data.shapesForKinetoEvent);
     dtypes_ = std::move(arg_data.dtypes);
     concrete_inputs_ = std::move(arg_data.concreteInputs);
+    kwinputs_ = std::move(op.kwinputs_);
   });
 }
 
@@ -760,6 +968,19 @@ const c10::ArrayRef<c10::IValue> KinetoEvent::concreteInputs() const {
   return concrete_inputs_;
 }
 
+bool KinetoEvent::hasKwinputs() const {
+  return !kwinputs_.empty();
+}
+
+bool KinetoEvent::isHiddenEvent() const {
+  return result_ && result_->hidden_;
+}
+
+const std::unordered_map<std::string, c10::IValue> KinetoEvent::kwinputs()
+    const {
+  return kwinputs_;
+}
+
 const c10::ArrayRef<std::string> KinetoEvent::stack() const {
   auto get = [&](const auto& i) -> auto& {
     return !i.jit_stack_.empty() ? i.jit_stack_ : python_stack_;
@@ -784,6 +1005,10 @@ const c10::ArrayRef<std::string> KinetoEvent::moduleHierarchy() const {
     return p->jit_modules_;
   }
   return {};
+}
+
+uint64_t KinetoEvent::endNs() const {
+  return result_->endTimeNS();
 }
 
 uint64_t KinetoEvent::durationNs() const {
@@ -856,6 +1081,17 @@ void KinetoEvent::getPerfEventCounters(std::vector<uint64_t>& in) const {
       [](const auto&) -> void { return; }));
 }
 
+std::string KinetoEvent::metadataJson() const {
+  return result_->visit(c10::overloaded(
+      [](const ExtraFields<EventType::TorchOp>& op) -> std::string {
+        return op.metadata_json_;
+      },
+      [](const ExtraFields<EventType::Kineto>& op) -> std::string {
+        return op.metadata_json_;
+      },
+      [](const auto&) -> std::string { return std::string(""); }));
+}
+
 #define FORWARD_FROM_RESULT(method_name, result_expr)                        \
   decltype(std::declval<KinetoEvent>().method_name())                        \
   KinetoEvent::method_name() const {                                         \
@@ -867,6 +1103,7 @@ FORWARD_FROM_RESULT(startThreadId, start_tid_)
 FORWARD_FROM_RESULT(endThreadId, endTID())
 FORWARD_FROM_RESULT(activityType, kinetoType())
 FORWARD_FROM_RESULT(name, name())
+FORWARD_FROM_RESULT(overload_name, overload_name())
 FORWARD_FROM_RESULT(deviceType, deviceType())
 FORWARD_FROM_RESULT(startNs, start_time_ns_)
 FORWARD_FROM_RESULT(correlationId, correlationID())

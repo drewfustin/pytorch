@@ -1,4 +1,5 @@
 # Owner(s): ["oncall: jit"]
+# ruff: noqa: F841
 
 import io
 import os
@@ -10,21 +11,19 @@ import torch
 import torch.nn as nn
 from torch.testing import FileCheck
 
+
 # Make the helper files in test/ importable
 pytorch_test_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(pytorch_test_dir)
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch.testing._internal.jit_utils
-from torch.testing._internal.common_utils import IS_SANDCASTLE, skipIfTorchDynamo
+from torch.testing._internal.common_utils import (
+    IS_SANDCASTLE,
+    raise_on_run_directly,
+    skipIfTorchDynamo,
+)
 from torch.testing._internal.jit_utils import JitTestCase, make_global
-
-if __name__ == "__main__":
-    raise RuntimeError(
-        "This test file is not meant to be run directly, use:\n\n"
-        "\tpython test/test_jit.py TESTNAME\n\n"
-        "instead."
-    )
 
 
 class TestClassType(JitTestCase):
@@ -93,7 +92,7 @@ class TestClassType(JitTestCase):
 
     def test_in(self):
         class FooTest:  # noqa: B903
-            def __init__(self):
+            def __init__(self) -> None:
                 pass
 
             def __contains__(self, key: str) -> bool:
@@ -457,7 +456,7 @@ class TestClassType(JitTestCase):
 
             @torch.jit.script
             class NoMethod:
-                def __init__(self):
+                def __init__(self) -> None:
                     pass
 
             @torch.jit.script
@@ -470,7 +469,7 @@ class TestClassType(JitTestCase):
 
         @torch.jit.script
         class WrongLt:
-            def __init__(self):
+            def __init__(self) -> None:
                 pass
 
             # lt method defined with the wrong signature
@@ -492,7 +491,7 @@ class TestClassType(JitTestCase):
     def test_class_inheritance(self):
         @torch.jit.script
         class Base:
-            def __init__(self):
+            def __init__(self) -> None:
                 self.b = 2
 
             def two(self, x):
@@ -576,7 +575,7 @@ class TestClassType(JitTestCase):
     def test_interface(self):
         @torch.jit.script
         class Foo:
-            def __init__(self):
+            def __init__(self) -> None:
                 pass
 
             def one(self, x, y):
@@ -587,7 +586,7 @@ class TestClassType(JitTestCase):
 
         @torch.jit.script
         class Bar:
-            def __init__(self):
+            def __init__(self) -> None:
                 pass
 
             def one(self, x, y):
@@ -625,7 +624,7 @@ class TestClassType(JitTestCase):
 
         @torch.jit.script
         class NotMember:
-            def __init__(self):
+            def __init__(self) -> None:
                 pass
 
             def one(self, x, y):
@@ -635,7 +634,7 @@ class TestClassType(JitTestCase):
 
         @torch.jit.script
         class NotMember2:
-            def __init__(self):
+            def __init__(self) -> None:
                 pass
 
             def one(self, x, y):
@@ -699,7 +698,7 @@ class TestClassType(JitTestCase):
 
         # Test interface/class python assignment
         class TestPyAssign(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.proxy_mod = Foo()
 
@@ -730,7 +729,7 @@ class TestClassType(JitTestCase):
 
         # test pure python object assignment to interface fails
         class PyClass:
-            def __init__(self):
+            def __init__(self) -> None:
                 pass
 
         with self.assertRaisesRegexWithHighlight(
@@ -946,7 +945,7 @@ class TestClassType(JitTestCase):
 
         @torch.jit.script
         class BadBool:
-            def __init__(self):
+            def __init__(self) -> None:
                 pass
 
             def __bool__(self):
@@ -960,7 +959,6 @@ class TestClassType(JitTestCase):
             def test():
                 if BadBool():
                     print(1)
-                    pass
 
     def test_init_compiled_first(self):
         @torch.jit.script  # noqa: B903
@@ -994,13 +992,13 @@ class TestClassType(JitTestCase):
     def test_optional_type_promotion(self):
         @torch.jit.script
         class Leaf:
-            def __init__(self):
+            def __init__(self) -> None:
                 self.x = 1
 
         # should not throw
         @torch.jit.script  # noqa: B903
         class Tree:  # noqa: B903
-            def __init__(self):
+            def __init__(self) -> None:
                 self.child = torch.jit.annotate(Optional[Leaf], None)
 
             def add_child(self, child: Leaf) -> None:
@@ -1014,7 +1012,7 @@ class TestClassType(JitTestCase):
 
             @torch.jit.script  # noqa: B903
             class Tree:  # noqa: B903
-                def __init__(self):
+                def __init__(self) -> None:
                     self.parent = torch.jit.annotate(Optional[Tree], None)
 
     def test_class_constant(self):
@@ -1072,7 +1070,7 @@ class TestClassType(JitTestCase):
 
         @torch.jit.script
         class Unused:
-            def __init__(self):
+            def __init__(self) -> None:
                 self.count: int = 0
                 self.items: List[int] = []
 
@@ -1089,7 +1087,7 @@ class TestClassType(JitTestCase):
                 return self.unused(y="hi", x=3)
 
         class ModuleWithUnused(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.obj = Unused()
 
@@ -1149,7 +1147,7 @@ class TestClassType(JitTestCase):
 
         @torch.jit.script
         class CompetitiveLinkingTokenReplacementUtils:
-            def __init__(self):
+            def __init__(self) -> None:
                 self.my_list: List[Tuple[float, int, int]] = []
                 self.my_dict: Dict[int, int] = {}
 
@@ -1429,7 +1427,7 @@ class TestClassType(JitTestCase):
         """
 
         class Example:
-            def __init__(self):
+            def __init__(self) -> None:
                 self._data: Dict[str, torch.Tensor] = {"1": torch.tensor(1.0)}
 
             def check(self, key: str) -> bool:
@@ -1447,7 +1445,7 @@ class TestClassType(JitTestCase):
 
         # Test the case in which the class does not have __delitem__ defined.
         class NoDelItem:
-            def __init__(self):
+            def __init__(self) -> None:
                 self._data: Dict[str, torch.Tensor] = {"1": torch.tensor(1.0)}
 
             def check(self, key: str) -> bool:
@@ -1475,7 +1473,7 @@ class TestClassType(JitTestCase):
         device_ty = torch.device
 
         class A:
-            def __init__(self):
+            def __init__(self) -> None:
                 pass
 
             def f(self, x: tensor_t, y: torch.device) -> tensor_t:
@@ -1536,7 +1534,7 @@ class TestClassType(JitTestCase):
 
     def test_class_attribute_wrong_type(self):
         """
-        Test that the error message displayed when convering a class type
+        Test that the error message displayed when converting a class type
         to an IValue that has an attribute of the wrong type.
         """
 
@@ -1546,7 +1544,7 @@ class TestClassType(JitTestCase):
                 self.val = val
 
         class Mod(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.mod1 = ValHolder("1")
                 self.mod2 = ValHolder("2")
@@ -1633,7 +1631,7 @@ class TestClassType(JitTestCase):
 
     def test_unresolved_class_attributes(self):
         class UnresolvedAttrClass:
-            def __init__(self):
+            def __init__(self) -> None:
                 pass
 
             (attr_a, attr_b), [attr_c, attr_d] = ("", ""), ["", ""]
@@ -1665,3 +1663,7 @@ class TestClassType(JitTestCase):
         for fn in (fn_a, fn_b, fn_c, fn_d, fn_e):
             with self.assertRaisesRegex(RuntimeError, error_message_regex):
                 torch.jit.script(fn)
+
+
+if __name__ == "__main__":
+    raise_on_run_directly("test/test_jit.py")

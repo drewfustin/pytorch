@@ -259,7 +259,7 @@ void histogramdd_out_cpu_template(const Tensor& self, const std::optional<Tensor
  *
  * Refer to histogramdd_out_cpu_template for more details.
  */
-static void histogramdd_kernel_impl(const Tensor& self, const std::optional<Tensor>& weight, bool density,
+void histogramdd_kernel_impl(const Tensor& self, const std::optional<Tensor>& weight, bool density,
         Tensor& hist, const TensorList& bin_edges) {
     histogramdd_out_cpu_template<BINARY_SEARCH>(self, weight, density, hist, bin_edges);
 }
@@ -269,7 +269,7 @@ static void histogramdd_kernel_impl(const Tensor& self, const std::optional<Tens
  *
  * Refer to histogramdd_out_cpu_template for more details.
  */
-static void histogramdd_linear_kernel_impl(const Tensor& self, const std::optional<Tensor>& weight,
+void histogramdd_linear_kernel_impl(const Tensor& self, const std::optional<Tensor>& weight,
         bool density, Tensor& hist, const TensorList& bin_edges, bool local_search) {
     if (local_search) {
         // histogramdd codepath: both hist and bin_edges are eventually returned as output,
@@ -287,8 +287,7 @@ template<typename scalar_t>
 void infer_bin_edges_from_input(const Tensor& input, const int64_t N,
         std::vector<double> &leftmost_edges, std::vector<double> &rightmost_edges) {
     // Calls aminmax on input with dim=0, reducing all but the innermost dimension of input.
-    Tensor min, max;
-    std::tie(min, max) = aminmax(input, 0);
+    auto [min, max] = aminmax(input, 0);
 
     TORCH_INTERNAL_ASSERT(min.is_contiguous() && max.is_contiguous());
 
@@ -299,7 +298,7 @@ void infer_bin_edges_from_input(const Tensor& input, const int64_t N,
     std::copy(max_data, max_data + N, rightmost_edges.begin());
 }
 
-static void histogram_select_outer_bin_edges_impl(const Tensor& input, const int64_t N,
+void histogram_select_outer_bin_edges_impl(const Tensor& input, const int64_t N,
         std::vector<double> &leftmost_edges, std::vector<double> &rightmost_edges) {
     AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "histogramdd", [&]() {
         infer_bin_edges_from_input<scalar_t>(input, N, leftmost_edges, rightmost_edges);
@@ -308,8 +307,8 @@ static void histogram_select_outer_bin_edges_impl(const Tensor& input, const int
 
 } // namespace
 
-REGISTER_DISPATCH(histogramdd_stub, &histogramdd_kernel_impl);
-REGISTER_DISPATCH(histogramdd_linear_stub, &histogramdd_linear_kernel_impl);
-REGISTER_DISPATCH(histogram_select_outer_bin_edges_stub, &histogram_select_outer_bin_edges_impl);
+REGISTER_DISPATCH(histogramdd_stub, &histogramdd_kernel_impl)
+REGISTER_DISPATCH(histogramdd_linear_stub, &histogramdd_linear_kernel_impl)
+REGISTER_DISPATCH(histogram_select_outer_bin_edges_stub, &histogram_select_outer_bin_edges_impl)
 
 } // namespace at::native

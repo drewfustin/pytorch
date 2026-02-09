@@ -124,7 +124,7 @@ struct IsUnique {};
 
 template <typename scalar_t>
 struct IsUnique<scalar_t, false> {
-  inline bool operator() (scalar_t* data_ptr, int64_t i) {
+  bool operator() (scalar_t* data_ptr, int64_t i) {
     if (i == 0) { return true; }
     return c10::load(&data_ptr[i]) != c10::load(&data_ptr[i - 1]);
   }
@@ -132,7 +132,7 @@ struct IsUnique<scalar_t, false> {
 
 template <typename scalar_t>
 struct IsUnique<scalar_t, true> {
-  inline bool operator() (scalar_t* data_ptr, int64_t i) {
+  bool operator() (scalar_t* data_ptr, int64_t i) {
     if (i == 0) { return true; }
     return (c10::load(&data_ptr[i]) != c10::load(&data_ptr[i - 1]))
         && !(_isnan(data_ptr[i]) && _isnan(data_ptr[i - 1]));
@@ -182,8 +182,7 @@ std::tuple<Tensor, Tensor, Tensor> unique_cpu_sorted_template(
   // is to return a output size of ([1]), `flatten` here will do the job
   auto input_flattened = input.flatten();
 
-  Tensor input_sorted, indices;
-  std::tie(input_sorted, indices) = input_flattened.sort();
+  auto [input_sorted, indices] = input_flattened.sort();
 
   scalar_t* input_sorted_data = input_sorted.data_ptr<scalar_t>();
   int64_t* indices_data = indices.data_ptr<int64_t>();

@@ -1,9 +1,7 @@
 # Owner(s): ["module: inductor"]
 import torch
-
 from torch._inductor.codegen.aoti_hipify_utils import maybe_hipify_code_wrapper
-from torch._inductor.codegen.codegen_device_driver import cuda_kernel_driver
-
+from torch._inductor.codegen.common import get_device_op_overrides
 from torch._inductor.test_case import run_tests, TestCase
 
 
@@ -14,7 +12,7 @@ TEST_CODES = [
     "CUdeviceptr var = reinterpret_cast<CUdeviceptr>(arg.data_ptr());",
     "at::cuda::CUDAStreamGuard guard(at::cuda::getStreamFromExternal());",
     # Hipification should be idempotent, hipifying should be a no-op for already hipified files
-    "at::hip::HIPStreamGuardMasqueradingAsCUDA guard(at::hip::getStreamFromExternalMasqueradingAsCUDA());",
+    "at::cuda::CUDAStreamGuard guard(at::cuda::getStreamFromExternal());",
 ]
 
 HIP_CODES = [
@@ -22,8 +20,8 @@ HIP_CODES = [
     "hipFunction_t kernel = nullptr;",
     "static hipFunction_t kernel = nullptr;",
     "hipDeviceptr_t var = reinterpret_cast<hipDeviceptr_t>(arg.data_ptr());",
-    "at::hip::HIPStreamGuardMasqueradingAsCUDA guard(at::hip::getStreamFromExternalMasqueradingAsCUDA());",
-    "at::hip::HIPStreamGuardMasqueradingAsCUDA guard(at::hip::getStreamFromExternalMasqueradingAsCUDA());",
+    "at::cuda::CUDAStreamGuard guard(at::cuda::getStreamFromExternal());",
+    "at::cuda::CUDAStreamGuard guard(at::cuda::getStreamFromExternal());",
 ]
 
 
@@ -36,35 +34,25 @@ class TestCppWrapperHipify(TestCase):
             self.assertEqual(result, expected)
 
     def test_hipify_aoti_driver_header(self) -> None:
-        header = cuda_kernel_driver()
+        cuda_codegen = get_device_op_overrides("cuda")
+        header = cuda_codegen.kernel_driver()
         expected = """
             #define CUDA_DRIVER_CHECK(EXPR)                    \\
             do {                                               \\
                 hipError_t code = EXPR;                          \\
                 const char *msg;                               \\
-                hipDrvGetErrorString(code, &msg);                  \\
+                hipError_t code_get_error = hipDrvGetErrorString(code, &msg); \\
+                if (code_get_error != hipSuccess) {          \\
+                    throw std::runtime_error(                  \\
+                        std::string("CUDA driver error: ") +   \\
+                        std::string("invalid error code!"));   \\
+                }                                              \\
                 if (code != hipSuccess) {                    \\
                     throw std::runtime_error(                  \\
                         std::string("CUDA driver error: ") +   \\
                         std::string(msg));                     \\
                 }                                              \\
             } while (0);
-
-            namespace {
-
-            struct Grid {
-                Grid(uint32_t x, uint32_t y, uint32_t z)
-                  : grid_x(x), grid_y(y), grid_z(z) {}
-                uint32_t grid_x;
-                uint32_t grid_y;
-                uint32_t grid_z;
-
-                bool is_non_zero() {
-                    return grid_x > 0 && grid_y > 0 && grid_z > 0;
-                }
-            };
-
-            }  // anonymous namespace
 
             static inline hipFunction_t loadKernel(
                     std::string filePath,
@@ -91,6 +79,21 @@ class TestCppWrapperHipify(TestCase):
                 return func;
             }
 
+            static inline hipFunction_t loadKernel(const void* start, const std::string &funcName, uint32_t sharedMemBytes) {
+                hipModule_t mod;
+                hipFunction_t func;
+                CUDA_DRIVER_CHECK(hipModuleLoadData(&mod, start));
+                CUDA_DRIVER_CHECK(hipModuleGetFunction(&func, mod, funcName.c_str()));
+                if (sharedMemBytes > 0) {
+                    CUDA_DRIVER_CHECK(hipFuncSetAttribute(
+                        func,
+                        hipFuncAttributeMaxDynamicSharedMemorySize,
+                        sharedMemBytes
+                    ))
+                }
+                return func;
+            }
+
             static inline void launchKernel(
                     hipFunction_t func,
                     uint32_t gridX,
@@ -106,7 +109,11 @@ class TestCppWrapperHipify(TestCase):
             }
         """
         if torch.version.hip is not None:
-            expected = expected.replace("32*numWarps", "64*numWarps")
+            # Adjusting the warp size to GPU supported wavefront size on AMD GPU
+            prop = torch.cuda.get_device_properties(torch.cuda.current_device())
+            expected = expected.replace(
+                "32*numWarps", str(prop.warp_size) + "*numWarps"
+            )
         result = maybe_hipify_code_wrapper(header, True)
         self.assertEqual(result.rstrip(), expected.rstrip())
 

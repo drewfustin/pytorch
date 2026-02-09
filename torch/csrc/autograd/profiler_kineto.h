@@ -23,7 +23,7 @@ using extra_meta_t = std::unordered_map<std::string, std::string>;
 
 struct TORCH_API KinetoEvent {
   KinetoEvent(
-      const std::shared_ptr<const torch::profiler::impl::Result>&,
+      const std::shared_ptr<const torch::profiler::impl::Result>& /*result*/,
       const bool verbose);
 
   uint64_t startThreadId() const;
@@ -36,6 +36,9 @@ struct TORCH_API KinetoEvent {
   const c10::ArrayRef<std::string> dtypes() const;
   bool hasConcreteInputs() const;
   const c10::ArrayRef<c10::IValue> concreteInputs() const;
+  bool hasKwinputs() const;
+  bool isHiddenEvent() const;
+  const std::unordered_map<std::string, c10::IValue> kwinputs() const;
   uint64_t flops() const;
   int64_t sequenceNr() const;
   bool hasStack() const;
@@ -45,10 +48,12 @@ struct TORCH_API KinetoEvent {
   const c10::ArrayRef<std::string> moduleHierarchy() const;
   int64_t debugHandle() const;
   std::string name() const;
+  std::string overload_name() const;
   c10::DeviceType deviceType() const;
   int deviceIndex() const;
   int64_t nBytes() const;
   uint64_t startNs() const;
+  uint64_t endNs() const;
   uint64_t durationNs() const;
   bool isAsync() const;
   uint64_t correlationId() const;
@@ -58,8 +63,9 @@ struct TORCH_API KinetoEvent {
   bool isPythonFunction() const;
   int64_t cudaElapsedUs() const;
   int64_t privateuse1ElapsedUs() const;
-  void getPerfEventCounters(torch::profiler::perf_counters_t&) const;
+  void getPerfEventCounters(torch::profiler::perf_counters_t& /*in*/) const;
   extra_meta_t extraMeta() const;
+  std::string metadataJson() const;
 
  private:
   torch::profiler::impl::ProfilerVoidEventStub fallbackStart() const;
@@ -72,6 +78,7 @@ struct TORCH_API KinetoEvent {
   std::vector<std::vector<int64_t>> shapes_;
   std::vector<std::string> dtypes_;
   std::vector<c10::IValue> concrete_inputs_;
+  std::unordered_map<std::string, c10::IValue> kwinputs_;
 };
 
 // Consolidating events returned directly from Kineto
@@ -175,6 +182,36 @@ TORCH_API std::unique_ptr<ProfilerResult> disableProfiler();
 TORCH_API void prepareProfiler(
     const torch::profiler::impl::ProfilerConfig& config,
     const std::set<torch::profiler::impl::ActivityType>& activities);
+
+TORCH_API void toggleCollectionDynamic(
+    const bool enable,
+    const std::set<torch::profiler::impl::ActivityType>& activities);
+
+TORCH_API void startMemoryProfile();
+TORCH_API void stopMemoryProfile();
+TORCH_API void exportMemoryProfile(const std::string& path);
+
+/**
+ * When a C++ thread really has no control over how the profiler was enabled,
+ * for example, by some unreachable Python code, it can call these functions
+ * to test/join/unjoin itself into the collection set of a profiler, if any.
+ * Without calling these functions, the symptom may be "not seeing GPU events
+ * from some child C++ threads". This is an example on how to use them,
+ *
+ *    using namespace torch::autograd::profiler;
+ *    bool enabled = isProfilerEnabledInMainThread();
+ *    if (enabled != saved_enabled_state) {
+ *      if (enabled) {
+ *        enableProfilerInChildThread();
+ *      } else {
+ *        disableProfilerInChildThread();
+ *      }
+ *      saved_enabled_state = enabled;
+ *    }
+ */
+TORCH_API bool isProfilerEnabledInMainThread();
+TORCH_API void enableProfilerInChildThread();
+TORCH_API void disableProfilerInChildThread();
 
 } // namespace autograd::profiler
 

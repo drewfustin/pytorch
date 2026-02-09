@@ -2,7 +2,7 @@
 # Now it only builds the Torch python bindings.
 
 if(NOT CAFFE2_CMAKE_BUILDING_WITH_MAIN_REPO)
-  cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
+  cmake_minimum_required(VERSION 3.27 FATAL_ERROR)
   project(torch CXX C)
   find_package(torch REQUIRED)
   option(USE_CUDA "Use CUDA" ON)
@@ -28,7 +28,6 @@ endif()
 
 set(LIBSHM_SRCDIR ${TORCH_SRC_DIR}/lib/${LIBSHM_SUBDIR})
 add_subdirectory(${LIBSHM_SRCDIR})
-
 
 # Generate files
 set(TOOLS_PATH "${TORCH_ROOT}/tools")
@@ -69,10 +68,12 @@ set(TORCH_PYTHON_INCLUDE_DIRECTORIES
     ${TORCH_ROOT}/third_party/flatbuffers/include
     ${TORCH_ROOT}/third_party/kineto/libkineto/include
     ${TORCH_ROOT}/third_party/cpp-httplib
+    ${TORCH_ROOT}/third_party/nlohmann/include
 
     ${TORCH_SRC_DIR}/csrc
     ${TORCH_SRC_DIR}/csrc/api/include
     ${TORCH_SRC_DIR}/lib
+    ${TORCH_SRC_DIR}/standalone
     )
 
 list(APPEND TORCH_PYTHON_INCLUDE_DIRECTORIES ${LIBSHM_SRCDIR})
@@ -80,8 +81,9 @@ list(APPEND TORCH_PYTHON_INCLUDE_DIRECTORIES ${LIBSHM_SRCDIR})
 set(TORCH_PYTHON_LINK_LIBRARIES
     Python::Module
     pybind::pybind11
-    opentelemetry::api
     httplib
+    nlohmann
+    moodycamel
     shm
     fmt::fmt-header-only
     ATEN_CPU_FILES_GEN_LIB)
@@ -91,6 +93,9 @@ if(USE_ASAN AND TARGET Sanitizer::address)
 endif()
 if(USE_ASAN AND TARGET Sanitizer::undefined)
   list(APPEND TORCH_PYTHON_LINK_LIBRARIES Sanitizer::undefined)
+endif()
+if(USE_LSAN AND TARGET Sanitizer::leak)
+  list(APPEND TORCH_PYTHON_LINK_LIBRARIES Sanitizer::leak)
 endif()
 if(USE_TSAN AND TARGET Sanitizer::thread)
   list(APPEND TORCH_PYTHON_LINK_LIBRARIES Sanitizer::thread)
@@ -133,8 +138,22 @@ if(USE_CUDA)
         list(APPEND TORCH_PYTHON_LINK_LIBRARIES torch::cudnn)
         list(APPEND TORCH_PYTHON_COMPILE_DEFINITIONS USE_CUDNN)
     endif()
+    if(USE_CUSPARSELT)
+        list(APPEND TORCH_PYTHON_LINK_LIBRARIES torch::cusparselt)
+        list(APPEND TORCH_PYTHON_COMPILE_DEFINITIONS USE_CUSPARSELT)
+    endif()
+    if(USE_CUFILE)
+        list(APPEND TORCH_PYTHON_LINK_LIBRARIES torch::cufile)
+        list(APPEND TORCH_PYTHON_COMPILE_DEFINITIONS USE_CUFILE)
+    endif()
 
-    list(APPEND TORCH_PYTHON_LINK_LIBRARIES torch::nvtoolsext)
+    if(TARGET torch::nvtx3)
+      list(APPEND TORCH_PYTHON_LINK_LIBRARIES torch::nvtx3)
+    else()
+      if(TARGET torch::nvtoolsext)
+        list(APPEND TORCH_PYTHON_LINK_LIBRARIES torch::nvtoolsext)
+      endif()
+    endif()
 endif()
 
 if(USE_ROCM)
@@ -145,13 +164,14 @@ if(USE_ROCM)
       USE_ROCM
       __HIP_PLATFORM_AMD__
       )
-    list(APPEND TORCH_PYTHON_LINK_LIBRARIES ${ROCM_ROCTX_LIB})
+    if(NOT WIN32)
+      list(APPEND TORCH_PYTHON_LINK_LIBRARIES ${ROCM_ROCTX_LIB})
+    endif()
 endif()
 
 if(USE_XPU)
     include(${TORCH_ROOT}/cmake/public/xpu.cmake)
     append_filelist("libtorch_python_xpu_sources" TORCH_PYTHON_SRCS)
-
     list(APPEND TORCH_PYTHON_COMPILE_DEFINITIONS USE_XPU)
 endif()
 
@@ -165,6 +185,10 @@ if(USE_CUDNN OR USE_ROCM)
           PROPERTIES COMPILE_DEFINITIONS "USE_STATIC_CUDNN"
         )
     endif()
+endif()
+
+if(USE_CUSPARSELT)
+    list(APPEND TORCH_PYTHON_SRCS ${TORCH_SRC_DIR}/csrc/cuda/shared/cusparselt.cpp)
 endif()
 
 if(USE_MPS)
@@ -229,6 +253,8 @@ add_custom_command(
       "${TORCH_ROOT}/aten/src/ATen/native/native_functions.yaml"
       "${TORCH_ROOT}/aten/src/ATen/native/tags.yaml"
       "${TORCH_ROOT}/tools/autograd/deprecated.yaml"
+      "${TORCH_ROOT}/torch/_torch_docs.py"
+      "${TORCH_ROOT}/torch/_tensor_docs.py"
       ${pyi_python}
       ${autograd_python}
       ${torchgen_python}
@@ -240,6 +266,7 @@ add_custom_command(
     OUTPUT
     "${TORCH_SRC_DIR}/utils/data/datapipes/datapipe.pyi"
     COMMAND
+    ${CMAKE_COMMAND} -E env --modify PYTHONPATH=path_list_prepend:"${TORCH_ROOT}" --
     "${Python_EXECUTABLE}" ${TORCH_SRC_DIR}/utils/data/datapipes/gen_pyi.py
     DEPENDS
     "${TORCH_SRC_DIR}/utils/data/datapipes/datapipe.pyi.in"
@@ -280,16 +307,6 @@ if(USE_NCCL AND NOT WIN32)
     list(APPEND TORCH_PYTHON_COMPILE_DEFINITIONS USE_NCCL)
 endif()
 
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  # Workaround for https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80947 in EmbeddingBag.cpp
-  set_source_files_properties(${TORCH_SRC_DIR}/csrc/utils/throughput_benchmark.cpp PROPERTIES COMPILE_FLAGS -Wno-attributes)
-endif()
-
-if(NOT MSVC)
-  # cudaProfilerInitialize must go away
-  set_source_files_properties(${TORCH_SRC_DIR}/csrc/cuda/shared/cudart.cpp PROPERTIES COMPILE_FLAGS "-Wno-deprecated-declarations")
-endif()
-
 # coreml
 if(USE_COREML_DELEGATE)
   list(APPEND TORCH_PYTHON_SRCS ${TORCH_SRC_DIR}/csrc/jit/backends/coreml/cpp/backend.cpp)
@@ -298,6 +315,11 @@ endif()
 
 
 add_library(torch_python SHARED ${TORCH_PYTHON_SRCS})
+torch_compile_options(torch_python)  # see cmake/public/utils.cmake
+if(APPLE)
+  target_compile_options(torch_python PRIVATE
+      $<$<COMPILE_LANGUAGE:CXX>: -fvisibility=default>)
+endif()
 
 if(CAFFE2_USE_MKL AND BUILD_LIBTORCHLESS)
 
@@ -315,6 +337,10 @@ if(USE_NUMPY)
   target_compile_definitions(torch_python PRIVATE USE_NUMPY)
 endif()
 
+if(USE_CUFILE AND NOT USE_ROCM)
+  target_compile_definitions(torch_python PRIVATE USE_CUFILE)
+endif()
+
 if(HAVE_SOVERSION)
   set_target_properties(torch_python PROPERTIES
       VERSION ${TORCH_VERSION} SOVERSION ${TORCH_SOVERSION})
@@ -322,11 +348,17 @@ endif()
 
 # in case of the split build we need to add compile definitions
 if(BUILD_LIBTORCHLESS)
+
+  if(USE_UCC)
+    target_link_libraries(torch_python PRIVATE __caffe2_ucc)
+    target_compile_definitions(torch_python PRIVATE USE_UCC)
+  endif()
+
   if(USE_UCC AND USE_C10D_UCC)
     target_compile_definitions(torch_python PRIVATE USE_C10D_UCC)
   endif()
 
-  if(USE_UCC AND USE_C10D_NCCL)
+  if(USE_NCCL AND USE_C10D_NCCL)
     target_compile_definitions(torch_python PRIVATE USE_C10D_NCCL)
   endif()
 
@@ -355,12 +387,6 @@ if(BUILD_LIBTORCHLESS)
   if("${EXPERIMENTAL_SINGLE_THREAD_POOL}")
     target_compile_definitions(torch_python PRIVATE "-DAT_EXPERIMENTAL_SINGLE_THREAD_POOL=1")
   endif()
-
-  if(MSVC AND NOT BUILD_SHARED_LIBS)
-    target_compile_definitions(torch_python PRIVATE "AT_CORE_STATIC_WINDOWS=1")
-  endif()
-
-
 
 endif()
 
@@ -400,6 +426,12 @@ if(USE_ROCM)
   set_source_files_properties(${TORCH_SRC_DIR}/csrc/cuda/Module.cpp PROPERTIES COMPILE_FLAGS "-DCUDA_ARCH_FLAGS=\"${PYTORCH_ROCM_ARCH_readable}\"")
 endif()
 
+# Preserve XPU arch flags
+if(USE_XPU)
+  string(REPLACE "," " " _ARCH_FLAGS_readable "${TORCH_XPU_ARCH_LIST}")
+  set_source_files_properties(${TORCH_SRC_DIR}/csrc/xpu/Module.cpp PROPERTIES COMPILE_FLAGS "-DXPU_ARCH_FLAGS=\"${_ARCH_FLAGS_readable}\"")
+endif()
+
 target_compile_definitions(torch_python PRIVATE "-DTHP_BUILD_MAIN_LIB")
 
 target_link_libraries(torch_python PRIVATE ${TORCH_LIB} ${TORCH_PYTHON_LINK_LIBRARIES})
@@ -409,6 +441,11 @@ target_compile_definitions(torch_python PRIVATE ${TORCH_PYTHON_COMPILE_DEFINITIO
 target_compile_options(torch_python PRIVATE ${TORCH_PYTHON_COMPILE_OPTIONS})
 
 target_include_directories(torch_python PUBLIC ${TORCH_PYTHON_INCLUDE_DIRECTORIES})
+
+# cpuinfo is needed for torch/csrc/cpu/Module.cpp
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(s390x|ppc64le)$")
+  target_link_libraries(torch_python PRIVATE cpuinfo)
+endif()
 
 if(USE_UCC)
   target_link_libraries(torch_python PRIVATE __caffe2_ucc)
@@ -420,6 +457,12 @@ if(BUILD_ONEDNN_GRAPH)
   if(NOT BUILD_LIBTORCHLESS)
     target_compile_definitions(torch_cpu PRIVATE "-DBUILD_ONEDNN_GRAPH")
   endif()
+endif()
+
+if(${CMAKE_BUILD_TYPE} STREQUAL "RelWithAssert")
+   # Workaround numerous decret-without-a-gil warnings from JIT
+   # see https://github.com/pytorch/pytorch/issues/130073
+   target_compile_definitions(torch_python PRIVATE "-DPYBIND11_NO_ASSERT_GIL_HELD_INCREF_DECREF")
 endif()
 
 if(NOT TORCH_PYTHON_LINK_FLAGS STREQUAL "")
@@ -435,20 +478,22 @@ else()
   set(TORCH_VERSION_DEBUG 0)
 endif()
 
-add_custom_command(
-  OUTPUT ${TORCH_SRC_DIR}/version.py
-  COMMAND "${CMAKE_COMMAND}" -E touch "${TOOLS_PATH}/generate_torch_version.py"
-  COMMAND
-    "${Python_EXECUTABLE}" "${TOOLS_PATH}/generate_torch_version.py"
-      --is-debug=${TORCH_VERSION_DEBUG}
-      --cuda-version=${CUDA_VERSION}
-      --hip-version=${HIP_VERSION}
-  DEPENDS ${TOOLS_PATH}/generate_torch_version.py
-  WORKING_DIRECTORY ${TORCH_ROOT}
-)
+set(CUDA_VERSION "")
+if(CUDAToolkit_VERSION_MAJOR)
+  set(CUDA_VERSION "${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR}")
+endif()
+
 add_custom_target(
   gen_torch_version ALL
-  DEPENDS ${TORCH_SRC_DIR}/version.py
+  "${Python_EXECUTABLE}" "${TOOLS_PATH}/generate_torch_version.py"
+    --is-debug=${TORCH_VERSION_DEBUG}
+    --cuda-version=${CUDA_VERSION}
+    --hip-version=${HIP_VERSION_CLEAN}
+    --rocm-version=${ROCM_VERSION_DEV}
+    --xpu-version=${SYCL_COMPILER_VERSION}
+  BYPRODUCTS ${TORCH_SRC_DIR}/version.py
+  COMMENT "Regenerating version file..."
+  WORKING_DIRECTORY ${TORCH_ROOT}
 )
 add_dependencies(torch_python gen_torch_version)
 
@@ -462,10 +507,11 @@ if(NOT ${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
           )
   # Pybind11 requires explicit linking of the torch_python library
   if(BUILD_LIBTORCHLESS)
-    target_link_libraries(nnapi_backend PRIVATE ${TORCH_LIB} torch_python pybind::pybind11)
+    target_link_libraries(nnapi_backend PRIVATE ${TORCH_LIB})
   else()
-    target_link_libraries(nnapi_backend PRIVATE torch torch_python pybind::pybind11)
+    target_link_libraries(nnapi_backend PRIVATE torch)
   endif()
+  target_link_libraries(nnapi_backend PRIVATE torch_python pybind::pybind11 fmt::fmt-header-only)
 endif()
 
 set(TORCH_PYTHON_COMPILE_OPTIONS ${TORCH_PYTHON_COMPILE_OPTIONS} PARENT_SCOPE)

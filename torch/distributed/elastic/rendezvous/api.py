@@ -7,11 +7,12 @@
 
 import socket
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, ClassVar, Dict, Optional
+from typing import Any, ClassVar
 
 from torch.distributed import Store
-from torch.distributed.elastic.utils.distributed import get_free_port as _get_free_port
+from torch.distributed.elastic.utils.distributed import get_free_port
 
 
 __all__ = [
@@ -68,17 +69,35 @@ class RendezvousStoreInfo:
     master_port: int
 
     @staticmethod
-    def build(rank: int, store: Store) -> "RendezvousStoreInfo":
+    def build(
+        rank: int,
+        store: Store,
+        local_addr: str | None,
+        server_port: int | None = None,
+    ) -> "RendezvousStoreInfo":
         """Factory method, finds unused new port on rank0 host and addr/port info with all ranks.
 
         If master_addr/master_port is knowns (useful when sharing existing tcp store server) use the constructor.
+
+        Args:
+            rank: rank of the current node
+            store: store to use for rendezvous
+            local_addr: address of the current node, if not provided will be resolved from hostname
+            server_port: port of the TCPStore server, when the TCPStore is shared.
         """
         # TODO swap to collectives comms API
         if rank == 0:
-            addr = socket.getfqdn()
-            port = _get_free_port()
-            store.set(RendezvousStoreInfo.MASTER_ADDR_KEY, addr.encode(encoding="UTF-8"))  # type: ignore[arg-type]
-            store.set(RendezvousStoreInfo.MASTER_PORT_KEY, str(port).encode(encoding="UTF-8"))  # type: ignore[arg-type]
+            addr = local_addr or socket.getfqdn()
+            # When TCPStore is not shared, we fallback to get_free_port.
+            port = server_port or get_free_port()
+            store.set(
+                RendezvousStoreInfo.MASTER_ADDR_KEY,
+                addr.encode(encoding="UTF-8"),  # type: ignore[arg-type]
+            )
+            store.set(
+                RendezvousStoreInfo.MASTER_PORT_KEY,
+                str(port).encode(encoding="UTF-8"),  # type: ignore[arg-type]
+            )
 
         addr = store.get(RendezvousStoreInfo.MASTER_ADDR_KEY).decode(encoding="UTF-8")
         port = int(
@@ -118,7 +137,7 @@ class RendezvousInfo:
         return self._world_size
 
     @property
-    def bootstrap_store_info(self) -> Optional[RendezvousStoreInfo]:
+    def bootstrap_store_info(self) -> RendezvousStoreInfo | None:
         """Store information that can used by trainer code to bootstrap distributed comms."""
         return self._bootstrap_store_info
 
@@ -139,9 +158,9 @@ class RendezvousHandler(ABC):
     @property
     def use_agent_store(self) -> bool:
         """Indicates that store reference returned by :py:meth:`next_rendezvous` can be shared with user
-        applications and will be available during application lifecyle.
+        applications and will be available during application lifecycle.
 
-        Rendezous handler impl will share store details as instance of :py:class:`RendezvousStoreInfo`.
+        Rendezvous handler impl will share store details as instance of :py:class:`RendezvousStoreInfo`.
         Applications as a convention use `MASTER_ADDR`/`MASTER_PORT` env variables to lookup the store.
         """
         return False
@@ -246,7 +265,7 @@ class RendezvousParameters:
         run_id: str,
         min_nodes: int,
         max_nodes: int,
-        local_addr: Optional[str] = None,
+        local_addr: str | None = None,
         **kwargs,
     ):
         if not backend:
@@ -274,7 +293,7 @@ class RendezvousParameters:
         """Return the value for ``key`` if ``key`` exists, else ``default``."""
         return self.config.get(key, default)
 
-    def get_as_bool(self, key: str, default: Optional[bool] = None) -> Optional[bool]:
+    def get_as_bool(self, key: str, default: bool | None = None) -> bool | None:
         """Return the value for ``key`` as a ``bool``."""
         value = self.get(key, default)
         if value is None or isinstance(value, bool):
@@ -293,7 +312,7 @@ class RendezvousParameters:
             f"The rendezvous configuration option '{key}' does not represent a valid boolean value."
         )
 
-    def get_as_int(self, key: str, default: Optional[int] = None) -> Optional[int]:
+    def get_as_int(self, key: str, default: int | None = None) -> int | None:
         """Return the value for ``key`` as an ``int``."""
         value = self.get(key, default)
         if value is None:
@@ -313,7 +332,7 @@ RendezvousHandlerCreator = Callable[[RendezvousParameters], RendezvousHandler]
 class RendezvousHandlerRegistry:
     """Represent a registry of :py:class:`RendezvousHandler` backends."""
 
-    _registry: Dict[str, RendezvousHandlerCreator]
+    _registry: dict[str, RendezvousHandlerCreator]
 
     def __init__(self) -> None:
         self._registry = {}
@@ -331,7 +350,7 @@ class RendezvousHandlerRegistry:
         if not backend:
             raise ValueError("The rendezvous backend name must be a non-empty string.")
 
-        current_creator: Optional[RendezvousHandlerCreator]
+        current_creator: RendezvousHandlerCreator | None
         try:
             current_creator = self._registry[backend]
         except KeyError:

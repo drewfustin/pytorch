@@ -3,6 +3,8 @@
 #include <ATen/ATen.h>
 #include <c10/util/Exception.h>
 #include <c10/util/accumulate.h>
+#include <c10/util/env.h>
+#include <c10/util/error.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 
@@ -46,14 +48,14 @@ TORCH_API std::vector<at::Tensor> getTensorShapes(
 // Turns at::IntArrayRef into "(1, 2, 3, 4)".
 inline std::string toString(at::IntArrayRef l) {
   std::stringstream ss;
-  ss << "(";
+  ss << '(';
   for (const auto i : c10::irange(l.size())) {
     if (i > 0) {
       ss << ", ";
     }
     ss << l[i];
   }
-  ss << ")";
+  ss << ')';
   return ss.str();
 }
 
@@ -92,7 +94,7 @@ inline std::vector<std::string> split(
 inline std::string getCvarString(
     const std::vector<std::string>& env,
     const char* def) {
-  const char* ret = def;
+  std::string ret(def);
 
   if (env.empty()) {
     TORCH_CHECK(false, "No environment variables passed");
@@ -103,14 +105,14 @@ inline std::string getCvarString(
    * versions of a variable get higher priority than the latter
    * versions of the same variable */
   for (ssize_t i = static_cast<ssize_t>(env.size()) - 1; i >= 0; i--) {
-    const char* val = std::getenv(env[i].c_str());
-    if (val == nullptr) {
+    auto val = c10::utils::get_env(env[i].c_str());
+    if (!val.has_value()) {
       continue;
     } else if (i) {
       WARN_ENV_VAR_ONCE(env[i], env[0]);
     }
 
-    ret = val;
+    ret = val.value();
   }
 
   return ret;
@@ -128,15 +130,15 @@ inline int getCvarInt(const std::vector<std::string>& env, int def) {
    * versions of a variable get higher priority than the latter
    * versions of the same variable */
   for (ssize_t i = static_cast<ssize_t>(env.size()) - 1; i >= 0; i--) {
-    char* val = std::getenv(env[i].c_str());
-    if (val == nullptr) {
+    const auto val = c10::utils::get_env(env[i].c_str());
+    if (!val.has_value()) {
       continue;
     } else if (i) {
       WARN_ENV_VAR_ONCE(env[i], env[0]);
     }
 
     try {
-      ret = std::stoi(val);
+      ret = std::stoi(val.value());
     } catch (std::exception&) {
       TORCH_CHECK(false, "Invalid value for environment variable: " + env[i]);
     }
@@ -157,15 +159,14 @@ inline bool getCvarBool(const std::vector<std::string>& env, bool def) {
    * versions of a variable get higher priority than the latter
    * versions of the same variable */
   for (ssize_t i = static_cast<ssize_t>(env.size()) - 1; i >= 0; i--) {
-    char* val_ = std::getenv(env[i].c_str());
-    if (val_ == nullptr) {
+    auto val = c10::utils::get_env(env[i].c_str());
+    if (!val.has_value()) {
       continue;
     } else if (i) {
       WARN_ENV_VAR_ONCE(env[i], env[0]);
     }
 
-    std::string val = std::string(val_);
-    for (auto& x : val) {
+    for (auto& x : val.value()) {
       // NOLINTNEXTLINE(*-narrowing-conversions)
       x = std::tolower(x);
     }
@@ -436,11 +437,11 @@ inline at::Tensor newLikeFlat(
   }
   at::DeviceGuard gpuGuard(device);
   std::vector<int64_t> sizes{static_cast<int64_t>(tensors[deviceIdx].size())};
-  std::vector<int64_t> strides{static_cast<int64_t>(t.numel())};
+  std::vector<int64_t> strides{t.numel()};
   sizes.insert(sizes.end(), t.sizes().begin(), t.sizes().end());
   strides.insert(strides.end(), t.strides().begin(), t.strides().end());
   return at::empty_strided(
-      sizes, strides, t.options().memory_format(c10::nullopt));
+      sizes, strides, t.options().memory_format(std::nullopt));
 }
 
 inline at::Tensor newLikeFlat(std::vector<at::Tensor>& tensors) {
@@ -557,6 +558,13 @@ size_t computeLengthsAndOffsets(
   return offset;
 }
 
+// Get the start and stride of the global rank from a list of global ranks
+// If the global ranks do not follow the consecutive rule, the stride will be -1
+void TORCH_API getGlobalRankStartAndStride(
+    const std::vector<uint64_t>& globalRanksInGroup,
+    int& globalRankStart,
+    int& globalRankStride);
+
 using RankType = uint32_t;
 using SizeType = uint64_t;
 
@@ -565,44 +573,44 @@ using SizeType = uint64_t;
 // (https://stackoverflow.com/a/20295079), and thus `errno` should really only
 // be inspected if an error occurred.
 //
-// `success_cond` is an expression used to check if an error has happend. So for
-// `fork()`, we can use `SYSCHECK(pid = fork(), pid != -1)`. The function output
-// is stored in variable `__output` and may be used in `success_cond`.
+// `success_cond` is an expression used to check if an error has happened. So
+// for `fork()`, we can use `SYSCHECK(pid = fork(), pid != -1)`. The function
+// output is stored in variable `__output` and may be used in `success_cond`.
 #ifdef _WIN32
-#define SYSCHECK(expr, success_cond)                                      \
-  while (true) {                                                          \
-    auto __output = (expr);                                               \
-    auto errno_local = WSAGetLastError();                                 \
-    (void)__output;                                                       \
-    if (!(success_cond)) {                                                \
-      if (errno == EINTR) {                                               \
-        continue;                                                         \
-      } else if (                                                         \
-          errno_local == WSAETIMEDOUT || errno_local == WSAEWOULDBLOCK) { \
-        C10_THROW_ERROR(DistNetworkError, "Socket Timeout");              \
-      } else {                                                            \
-        C10_THROW_ERROR(DistNetworkError, std::strerror(errno_local));    \
-      }                                                                   \
-    } else {                                                              \
-      break;                                                              \
-    }                                                                     \
+#define SYSCHECK(expr, success_cond)                                           \
+  while (true) {                                                               \
+    auto __output = (expr);                                                    \
+    auto errno_local = WSAGetLastError();                                      \
+    (void)__output;                                                            \
+    if (!(success_cond)) {                                                     \
+      if (errno == EINTR) {                                                    \
+        continue;                                                              \
+      } else if (                                                              \
+          errno_local == WSAETIMEDOUT || errno_local == WSAEWOULDBLOCK) {      \
+        C10_THROW_ERROR(DistNetworkError, "Socket Timeout");                   \
+      } else {                                                                 \
+        C10_THROW_ERROR(DistNetworkError, c10::utils::str_error(errno_local)); \
+      }                                                                        \
+    } else {                                                                   \
+      break;                                                                   \
+    }                                                                          \
   }
 #else
-#define SYSCHECK(expr, success_cond)                             \
-  while (true) {                                                 \
-    auto __output = (expr);                                      \
-    (void)__output;                                              \
-    if (!(success_cond)) {                                       \
-      if (errno == EINTR) {                                      \
-        continue;                                                \
-      } else if (errno == EAGAIN || errno == EWOULDBLOCK) {      \
-        C10_THROW_ERROR(DistNetworkError, "Socket Timeout");     \
-      } else {                                                   \
-        C10_THROW_ERROR(DistNetworkError, std::strerror(errno)); \
-      }                                                          \
-    } else {                                                     \
-      break;                                                     \
-    }                                                            \
+#define SYSCHECK(expr, success_cond)                                     \
+  while (true) {                                                         \
+    auto __output = (expr);                                              \
+    (void)__output;                                                      \
+    if (!(success_cond)) {                                               \
+      if (errno == EINTR) {                                              \
+        continue;                                                        \
+      } else if (errno == EAGAIN || errno == EWOULDBLOCK) {              \
+        C10_THROW_ERROR(DistNetworkError, "Socket Timeout");             \
+      } else {                                                           \
+        C10_THROW_ERROR(DistNetworkError, c10::utils::str_error(errno)); \
+      }                                                                  \
+    } else {                                                             \
+      break;                                                             \
+    }                                                                    \
   }
 #endif
 
@@ -610,8 +618,6 @@ using SizeType = uint64_t;
 // this common case with `SYSCHECK`.
 // Since SOCKET_ERROR = -1 in MSVC, so also leverage SYSCHECK_ERR_RETURN_NEG1
 #define SYSCHECK_ERR_RETURN_NEG1(expr) SYSCHECK(expr, __output != -1)
-
-void checkForNan(const at::Tensor& tensor);
 
 namespace tcputil {
 
@@ -647,7 +653,11 @@ void sendBytes(
     SYSCHECK_ERR_RETURN_NEG1(
         bytesSent = ::send(socket, currentBytes, bytesToSend, flags))
     if (bytesSent == 0) {
-      C10_THROW_ERROR(DistNetworkError, std::strerror(ECONNRESET));
+      C10_THROW_ERROR(
+          DistNetworkError,
+          "Failed to send, sent 0 bytes. "
+          "Connection was likely closed. "
+          "Did the remote server shutdown or crash?");
     }
 
     bytesToSend -= bytesSent;
@@ -669,7 +679,11 @@ void recvBytes(int socket, T* buffer, size_t length) {
     SYSCHECK_ERR_RETURN_NEG1(
         bytesReceived = recv(socket, currentBytes, bytesToReceive, 0))
     if (bytesReceived == 0) {
-      C10_THROW_ERROR(DistNetworkError, std::strerror(ECONNRESET));
+      C10_THROW_ERROR(
+          DistNetworkError,
+          "Failed to recv, got 0 bytes. "
+          "Connection was likely closed. "
+          "Did the remote server shutdown or crash?");
     }
 
     bytesToReceive -= bytesReceived;

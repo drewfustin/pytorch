@@ -1,24 +1,34 @@
-# mypy: allow-untyped-defs
 from __future__ import annotations
 
 import functools
-import getpass
-import inspect
 import operator
-import os
-import re
-import tempfile
-import time
+from typing import Any, TYPE_CHECKING
+
+import sympy
 
 import torch
 
+# NOTE: other files rely on the imports below
+from torch._dynamo import callback as compilation_callback  # noqa: F401
+from torch._inductor.runtime.cache_dir_utils import (  # noqa: F401
+    cache_dir,
+    default_cache_dir,
+    triton_cache_dir,
+)
 
-def conditional_product(*args):
+
+if TYPE_CHECKING:
+    from collections.abc import Hashable
+
+    from .triton_compat import Config
+
+
+def conditional_product(*args: int) -> int:
     return functools.reduce(operator.mul, [x for x in args if x])
 
 
-def ceildiv(numer: int, denom: int) -> int:
-    return -(numer // -denom)
+def ceildiv(number: int, denom: int) -> int:
+    return -(number // -denom)
 
 
 def is_power_of_2(n: int) -> bool:
@@ -28,15 +38,17 @@ def is_power_of_2(n: int) -> bool:
 
 def next_power_of_2(n: int) -> int:
     """Return the smallest power of 2 greater than or equal to n"""
-    n -= 1
-    n |= n >> 1
-    n |= n >> 2
-    n |= n >> 4
-    n |= n >> 8
-    n |= n >> 16
-    n |= n >> 32
-    n += 1
-    return n
+    if isinstance(n, sympy.Integer):
+        n = int(n)
+    if n <= 0:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def last_power_of_2(n: int) -> int:
+    """Return the largest power of 2 less than or equal to n"""
+    next_pow2 = next_power_of_2(n)
+    return next_pow2 // 2 if next_pow2 > n else next_pow2
 
 
 def get_num_bytes(*args: torch.Tensor, num_in_out_args: int = 0) -> int:
@@ -55,134 +67,86 @@ def get_num_bytes(*args: torch.Tensor, num_in_out_args: int = 0) -> int:
     )
 
 
-def triton_config_to_hashable(cfg):
+def triton_config_to_hashable(cfg: Config) -> Hashable:
     """
     Convert triton config to a tuple that can uniquely identify it. We can use
     the return value as a dictionary key.
     """
+    # pyrefly: ignore [missing-attribute]
     items = sorted(cfg.kwargs.items())
+    # pyrefly: ignore [missing-attribute]
     items.append(("num_warps", cfg.num_warps))
+    # pyrefly: ignore [missing-attribute]
     items.append(("num_stages", cfg.num_stages))
     return tuple(items)
 
 
-def create_bandwidth_info_str(ms, num_gb, gb_per_s, prefix="", suffix="", color=True):
+def validate_triton_config(cfg: Config) -> None:
+    # [Note: Triton pre_hook in inductor]
+    # pre-hook is a lambda function, which we don't attempt to serialize.
+    # right now, if a pre-hook is attached to the config, it will not be saved;
+    # and then it won't be used when the config is loaded from cache.
+    # So we assert - if we do get a pre_hook, it might get ignored after caching.
+    assert getattr(cfg, "pre_hook", None) is None, (
+        "triton configs with pre_hooks not supported"
+    )
+
+
+def create_bandwidth_info_str(
+    ms: float,
+    num_gb: float,
+    gb_per_s: float,
+    prefix: str = "",
+    suffix: str = "",
+    color: bool = True,
+) -> str:
     info_str = f"{prefix}{ms:.3f}ms    \t{num_gb:.3f} GB \t {gb_per_s:7.2f}GB/s{suffix}"
     slow = ms > 0.012 and gb_per_s < 650
     return red_text(info_str) if color and slow else info_str
 
 
-def get_max_y_grid():
+def get_max_y_grid() -> int:
     return 65535
 
 
-def do_bench(fn, fn_args, fn_kwargs, **kwargs):
-    from torch._inductor.utils import is_cpu_device
-
-    args = list(fn_args)
-    args.extend(fn_kwargs.values())
-    if is_cpu_device(args):
-        return do_bench_cpu(lambda: fn(*fn_args, **fn_kwargs), **kwargs)
-    else:
-        return do_bench_gpu(lambda: fn(*fn_args, **fn_kwargs), **kwargs)
-
-
-def do_bench_gpu(*args, **kwargs):
-    @functools.lru_cache(None)
-    def load_triton():
-        try:
-            # NB: Lazily load triton, as importing triton is slow
-            # see https://github.com/openai/triton/issues/1599
-            from triton.testing import do_bench as triton_do_bench
-        except ImportError as exc:
-            raise NotImplementedError("requires Triton") from exc
-
-        # triton PR https://github.com/openai/triton/pull/1513 change the
-        # quantile fields name from 'percentiles' to 'quantiles'
-        # and change the default value from (0.5, 0.2, 0.8) to None.
-        # This may break inductor since a caller expects a tuple may get a item.
-        #
-        # Add a wrapper to maintain the same behavior for inductor.
-        # Maybe we should have own implementation of this function?
-        return triton_do_bench, (
-            "quantiles"
-            if inspect.signature(triton_do_bench).parameters.get("quantiles")
-            is not None
-            else "percentiles"
-        )
-
-    triton_do_bench, quantile_field_name = load_triton()
-
-    if quantile_field_name not in kwargs:
-        kwargs[quantile_field_name] = (0.5, 0.2, 0.8)
-    return triton_do_bench(*args, **kwargs)[0]
-
-
-def do_bench_cpu(fn, warmup=5, times=20):
-    assert times > 0
-    for _ in range(warmup):
-        fn()
-    durations = []
-    for _ in range(times):
-        t0 = time.perf_counter()
-        fn()
-        t1 = time.perf_counter()
-        durations.append((t1 - t0) * 1000)
-    # return the median time
-    sorted_durations = sorted(durations)
-    if times % 2 == 0:
-        return (sorted_durations[times // 2 - 1] + sorted_durations[times // 2]) / 2
-    else:
-        return sorted_durations[times // 2]
-
-
-def cache_dir() -> str:
-    cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
-    if cache_dir is None:
-        os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir = default_cache_dir()
-    os.makedirs(cache_dir, exist_ok=True)
-    return cache_dir
-
-
-def default_cache_dir():
-    sanitized_username = re.sub(r'[\\/:*?"<>|]', "_", getpass.getuser())
-    return os.path.join(
-        tempfile.gettempdir(),
-        "torchinductor_" + sanitized_username,
-    )
-
-
-HAS_COLORAMA = True
 try:
     import colorama
-except ImportError:
+
+    HAS_COLORAMA = True
+except ModuleNotFoundError:
     HAS_COLORAMA = False
+    colorama = None  # type: ignore[assignment]
 
 
-def _color_text(msg, color):
-    if not HAS_COLORAMA:
+if HAS_COLORAMA:
+
+    def _color_text(msg: str, color: str) -> str:
+        # pyrefly: ignore [missing-attribute]
+        return getattr(colorama.Fore, color.upper()) + msg + colorama.Fore.RESET
+
+else:
+
+    def _color_text(msg: str, color: str) -> str:
         return msg
 
-    return getattr(colorama.Fore, color.upper()) + msg + colorama.Fore.RESET
 
-
-def green_text(msg):
+def green_text(msg: str) -> str:
     return _color_text(msg, "green")
 
 
-def yellow_text(msg):
+def yellow_text(msg: str) -> str:
     return _color_text(msg, "yellow")
 
 
-def red_text(msg):
+def red_text(msg: str) -> str:
     return _color_text(msg, "red")
 
 
-def blue_text(msg):
+def blue_text(msg: str) -> str:
     return _color_text(msg, "blue")
 
 
-def get_first_attr(obj, *attrs):
+def get_first_attr(obj: Any, *attrs: str) -> Any:
     """
     Return the first available attribute or throw an exception if none is present.
     """
@@ -193,11 +157,131 @@ def get_first_attr(obj, *attrs):
     raise AssertionError(f"{obj} does not has any of the attributes: {attrs}")
 
 
-try:
-    dynamo_timed = torch._dynamo.utils.dynamo_timed
-except AttributeError:  # Compile workers only have a mock version of torch
+dynamo_timed = torch._dynamo.utils.dynamo_timed  # type: ignore[has-type]
 
-    def dynamo_timed(original_function=None, phase_name=None, fwd_only=True):
-        if original_function:
-            return original_function
-        return dynamo_timed
+
+def triton_hash_to_path_key(key: str) -> str:
+    # In early versions of Triton, the hash is directly used in the path name.
+    # Later, the hash is converted to base64 before being used in the path name.
+    # Later, the base64 conversion was replaced to the base32
+    #
+    # This code tries to import _base64 and falls back to _base32 if _base64 is unavailable.
+    #
+    # To handle this, try to import the to-base64-conversion function.
+    # If it exists, use it; otherwise, try using _base32; if both are unavailable, use the hash directly.
+    try:
+        from triton.runtime.cache import _base64
+
+        return _base64(key)
+    except Exception:
+        try:
+            from triton.runtime.cache import _base32
+
+            return _base32(key)
+        except Exception:
+            return key
+
+
+def compile_mps_shader(source: str) -> Any:
+    """
+    Compiles shader source but raise more actionable error message when needed
+    """
+    try:
+        return torch.mps.compile_shader(source)
+    except SyntaxError as err:
+        raise SyntaxError(f"failed to compile {source} with {err.msg}") from err
+
+
+def torch_dtype_to_jax_runtime(dtype: torch.dtype) -> Any:
+    """
+    Map PyTorch dtype to actual JAX dtype object at runtime.
+
+    This helper is used in generated Pallas kernels at runtime to convert
+    PyTorch dtypes to JAX dtype objects (not string representations).
+
+    Args:
+        dtype: PyTorch dtype to convert
+
+    Returns:
+        JAX dtype object (e.g., jnp.float32 object itself)
+    """
+    import jax.numpy as jnp  # pyrefly: ignore [import-error, missing-import]
+
+    dtype_map = {
+        torch.float32: jnp.float32,
+        torch.float64: jnp.float64,
+        torch.float16: jnp.float16,
+        torch.bfloat16: jnp.bfloat16,
+        torch.int32: jnp.int32,
+        torch.int64: jnp.int64,
+        torch.int16: jnp.int16,
+        torch.int8: jnp.int8,
+        torch.uint8: jnp.uint8,
+        torch.bool: jnp.bool_,
+        torch.complex64: jnp.complex64,
+        torch.complex128: jnp.complex128,
+    }
+    if dtype not in dtype_map:
+        raise ValueError(f"Unsupported dtype for JAX conversion: {dtype}")
+    return dtype_map[dtype]
+
+
+def torch_dtype_to_jax(dtype: torch.dtype) -> str:
+    """
+    Map PyTorch dtype to JAX dtype expression string.
+
+    This helper is used at compile time in codegen to generate
+    JAX dtype expressions for Pallas kernels.
+
+    Args:
+        dtype: PyTorch dtype to convert
+
+    Returns:
+        JAX dtype expression as string (e.g., "jnp.float32")
+    """
+    jax_dtype = torch_dtype_to_jax_runtime(dtype)
+    dtype_name = jax_dtype.__name__
+    if dtype_name == "bool":
+        dtype_name = "bool_"
+    return f"jnp.{dtype_name}"
+
+
+def pallas_partial_reduce(reduce_fn: Any, v: Any, pw_numel: int, red_numel: int) -> Any:
+    """
+    Helper for partial reductions in Pallas kernels.
+
+    Reorders axes and reduces, returning result with keepdims-style shape
+    for proper in-kernel broadcasting.
+
+    Args:
+        reduce_fn: The reduction function to apply (e.g., jnp.sum, jnp.max)
+        v: The input array to reduce
+        pw_numel: The number of pointwise elements
+        red_numel: The number of reduction elements
+
+    Returns:
+        Reduced array with keepdims-style shape
+    """
+    import jax.numpy as jnp  # pyrefly: ignore [import-error, missing-import]
+
+    shape = tuple(v.shape)
+    # Find contiguous axes whose product = red_numel (search from right)
+    red_axes = None
+    for i in range(len(shape) - 1, -1, -1):
+        prod = 1
+        for j in range(i, -1, -1):
+            prod *= shape[j]
+            if prod == red_numel:
+                red_axes = list(range(j, i + 1))
+                break
+        if red_axes is not None:
+            break
+    if red_axes is None:
+        red_axes = [len(shape) - 1]
+    # Build output shape with 1s for reduced dimensions (keepdims style)
+    out_shape = tuple(1 if i in red_axes else s for i, s in enumerate(shape))
+    # Move pointwise axes to front, reduction axes to back
+    pw_axes = [i for i in range(len(shape)) if i not in red_axes]
+    reordered = jnp.moveaxis(v, pw_axes, list(range(len(pw_axes))))
+    result = reduce_fn(reordered.reshape(pw_numel, red_numel), axis=-1)
+    return result.reshape(out_shape)

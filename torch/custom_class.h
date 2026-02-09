@@ -12,6 +12,8 @@
 #include <c10/util/TypeTraits.h>
 #include <torch/custom_class_detail.h>
 #include <torch/library.h>
+
+#include <functional>
 #include <sstream>
 
 namespace torch {
@@ -60,7 +62,7 @@ decltype(auto) init(Func&& f) {
 template <class CurClass>
 class class_ : public ::torch::detail::class_base {
   static_assert(
-      std::is_base_of<CustomClassHolder, CurClass>::value,
+      std::is_base_of_v<CustomClassHolder, CurClass>,
       "torch::class_<T> requires T to inherit from CustomClassHolder");
 
  public:
@@ -88,7 +90,7 @@ class class_ : public ::torch::detail::class_base {
   /// constructor taking an `int` and a `std::string` as argument.
   template <typename... Types>
   class_& def(
-      torch::detail::types<void, Types...>,
+      torch::detail::types<void, Types...> /*unused*/,
       std::string doc_string = "",
       std::initializer_list<arg> default_args =
           {}) { // Used in combination with
@@ -117,7 +119,7 @@ class class_ : public ::torch::detail::class_base {
                                    c10::tagged_capsule<CurClass> self,
                                    ParameterTypes... arg) {
       c10::intrusive_ptr<CurClass> classObj =
-          at::guts::invoke(func, std::forward<ParameterTypes>(arg)...);
+          std::invoke(func, std::forward<ParameterTypes>(arg)...);
       auto object = self.ivalue.toObject();
       object->setSlot(0, c10::IValue::make_capsule(classObj));
     };
@@ -285,7 +287,7 @@ class class_ : public ::torch::detail::class_base {
   ///     __getstate__(intrusive_ptr<CurClass>) -> T1
   ///     __setstate__(T2) -> intrusive_ptr<CurClass>
   ///
-  /// `T1` must be an object that is convertable to IValue by the same rules
+  /// `T1` must be an object that is convertible to IValue by the same rules
   /// for custom op/method registration.
   ///
   /// For the common case, T1 == T2. T1 can also be a subtype of T2. An
@@ -322,9 +324,9 @@ class class_ : public ::torch::detail::class_base {
         typename SetStateTraits::parameter_types>;
     auto setstate_wrapper = [set_state = std::forward<SetStateFn>(set_state)](
                                 c10::tagged_capsule<CurClass> self,
-                                SetStateArg&& arg) {
+                                SetStateArg arg) {
       c10::intrusive_ptr<CurClass> classObj =
-          at::guts::invoke(set_state, std::forward<SetStateArg>(arg));
+          std::invoke(set_state, std::move(arg));
       auto object = self.ivalue.toObject();
       object->setSlot(0, c10::IValue::make_capsule(classObj));
     };
@@ -335,11 +337,13 @@ class class_ : public ::torch::detail::class_base {
 
     // type validation
     auto getstate_schema = classTypePtr->getMethod("__getstate__").getSchema();
+#ifndef STRIP_ERROR_MESSAGES
     auto format_getstate_schema = [&getstate_schema]() {
       std::stringstream ss;
       ss << getstate_schema;
       return ss.str();
     };
+#endif
     TORCH_CHECK(
         getstate_schema.arguments().size() == 1,
         "__getstate__ should take exactly one argument: self. Got: ",
@@ -440,7 +444,7 @@ c10::IValue make_custom_class(CtorArgs&&... args) {
 }
 
 // Alternative api for creating a torchbind class over torch::class_ this api is
-// preffered to prevent size regressions on Edge usecases. Must be used in
+// preferred to prevent size regressions on Edge usecases. Must be used in
 // conjunction with TORCH_SELECTIVE_CLASS macro aka
 // selective_class<foo>("foo_namespace", TORCH_SELECTIVE_CLASS("foo"))
 template <class CurClass>
@@ -453,8 +457,8 @@ inline class_<CurClass> selective_class_(
 
 template <class CurClass>
 inline detail::ClassNotSelected selective_class_(
-    const std::string&,
-    detail::SelectiveStr<false>) {
+    const std::string& /*unused*/,
+    detail::SelectiveStr<false> /*unused*/) {
   return detail::ClassNotSelected();
 }
 
@@ -508,7 +512,7 @@ inline class_<CurClass> Library::class_(detail::SelectiveStr<true> className) {
 }
 
 template <class CurClass>
-inline detail::ClassNotSelected Library::class_(detail::SelectiveStr<false>) {
+inline detail::ClassNotSelected Library::class_(detail::SelectiveStr<false> /*unused*/) {
   return detail::ClassNotSelected();
 }
 

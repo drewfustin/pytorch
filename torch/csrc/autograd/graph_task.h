@@ -48,6 +48,9 @@ struct GraphTask : std::enable_shared_from_this<GraphTask> {
     struct Capture {
       Capture(const Capture&) = delete;
       Capture(Capture&&) = default;
+      Capture& operator=(const Capture&) = delete;
+      Capture& operator=(Capture&&) = default;
+      ~Capture() = default;
 
       Capture(int input_idx, int output_idx)
           : input_idx_(input_idx), output_idx_(output_idx) {}
@@ -119,7 +122,7 @@ struct GraphTask : std::enable_shared_from_this<GraphTask> {
 
   // Note: this field is not ready to be used until the proper
   // `thread_locals_.set_grad_mode()` call in the constructor.
-  at::ThreadLocalState thread_locals_ = at::ThreadLocalState();
+  at::ThreadLocalState thread_locals_;
 
   std::unordered_set<c10::Stream> leaf_streams;
 
@@ -139,7 +142,7 @@ struct GraphTask : std::enable_shared_from_this<GraphTask> {
   // The value of worker_device in the thread that created this task.
   // See Note [Reentrant backwards]
   // Safe to read owner_ and reentrant_depth_ without synchronization
-  int owner_;
+  int owner_{NO_DEVICE};
   // The number of parent graph tasks for this graph task
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const int reentrant_depth_;

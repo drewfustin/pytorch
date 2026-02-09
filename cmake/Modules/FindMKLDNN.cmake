@@ -20,30 +20,34 @@ IF(NOT MKLDNN_FOUND)
   SET(MKLDNN_ROOT "${PROJECT_SOURCE_DIR}/third_party/ideep/mkl-dnn")
 
   if(USE_XPU) # Build oneDNN GPU library
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    if(WIN32)
+      # Windows
+      set(DNNL_HOST_COMPILER "DEFAULT")
+      set(SYCL_CXX_DRIVER "icx")
+      set(DNNL_LIB_NAME "dnnl.lib")
+    elseif(LINUX)
       # Linux
       # g++ is soft linked to /usr/bin/cxx, oneDNN would not treat it as an absolute path
       set(DNNL_HOST_COMPILER "g++")
       set(SYCL_CXX_DRIVER "icpx")
       set(DNNL_LIB_NAME "libdnnl.a")
     else()
-      # Windows
-      set(DNNL_HOST_COMPILER "DEFAULT")
-      set(SYCL_CXX_DRIVER "icx")
-      set(DNNL_LIB_NAME "dnnl.lib")
+      MESSAGE(FATAL_ERROR "OneDNN for Intel GPU in PyTorch currently supports only Windows and Linux.
+                           Detected system '${CMAKE_SYSTEM_NAME}' is not supported.")
     endif()
 
     set(DNNL_MAKE_COMMAND "cmake" "--build" ".")
     include(ProcessorCount)
     ProcessorCount(proc_cnt)
-    if ((DEFINED ENV{MAX_JOBS}) AND ("$ENV{MAX_JOBS}" LESS_EQUAL ${proc_cnt}))
+    if((DEFINED ENV{MAX_JOBS}) AND ("$ENV{MAX_JOBS}" LESS_EQUAL ${proc_cnt}))
       list(APPEND DNNL_MAKE_COMMAND "-j" "$ENV{MAX_JOBS}")
       if(CMAKE_GENERATOR MATCHES "Make|Ninja")
         list(APPEND DNNL_MAKE_COMMAND "--" "-l" "$ENV{MAX_JOBS}")
       endif()
     endif()
     ExternalProject_Add(xpu_mkldnn_proj
-      SOURCE_DIR ${MKLDNN_ROOT}
+      GIT_REPOSITORY https://github.com/uxlfoundation/oneDNN
+      GIT_TAG v3.10.2
       PREFIX ${XPU_MKLDNN_DIR_PREFIX}
       BUILD_IN_SOURCE 0
       CMAKE_ARGS  -DCMAKE_C_COMPILER=icx
@@ -52,7 +56,7 @@ IF(NOT MKLDNN_FOUND)
       -DDNNL_CPU_RUNTIME=THREADPOOL
       -DDNNL_BUILD_TESTS=OFF
       -DDNNL_BUILD_EXAMPLES=OFF
-      -DONEDNN_BUILD_GRAPH=OFF
+      -DONEDNN_BUILD_GRAPH=ON
       -DDNNL_LIBRARY_TYPE=STATIC
       -DDNNL_DPCPP_HOST_COMPILER=${DNNL_HOST_COMPILER} # Use global cxx compiler as host compiler
       -G ${CMAKE_GENERATOR} # Align Generator to Torch
@@ -61,16 +65,15 @@ IF(NOT MKLDNN_FOUND)
       INSTALL_COMMAND ""
     )
 
-    ExternalProject_Get_Property(xpu_mkldnn_proj BINARY_DIR)
-    set(__XPU_MKLDNN_BUILD_DIR ${BINARY_DIR})
-    set(XPU_MKLDNN_LIBRARIES ${__XPU_MKLDNN_BUILD_DIR}/src/${DNNL_LIB_NAME})
-    set(XPU_MKLDNN_INCLUDE ${__XPU_MKLDNN_BUILD_DIR}/include)
+    ExternalProject_Get_Property(xpu_mkldnn_proj SOURCE_DIR BINARY_DIR)
+    set(XPU_MKLDNN_LIBRARIES ${BINARY_DIR}/src/${DNNL_LIB_NAME})
+    set(XPU_MKLDNN_INCLUDE ${SOURCE_DIR}/include ${BINARY_DIR}/include)
     # This target would be further linked to libtorch_xpu.so.
     # The libtorch_xpu.so would contain Conv&GEMM operators that depend on
     # oneDNN primitive implementations inside libdnnl.a.
     add_library(xpu_mkldnn INTERFACE)
     add_dependencies(xpu_mkldnn xpu_mkldnn_proj)
-    target_link_libraries(xpu_mkldnn INTERFACE ${__XPU_MKLDNN_BUILD_DIR}/src/${DNNL_LIB_NAME})
+    target_link_libraries(xpu_mkldnn INTERFACE ${XPU_MKLDNN_LIBRARIES})
     target_include_directories(xpu_mkldnn INTERFACE ${XPU_MKLDNN_INCLUDE})
   endif()
 
@@ -81,13 +84,22 @@ IF(NOT MKLDNN_FOUND)
     SET(ONEDNN_BUILD_GRAPH ON CACHE BOOL "" FORCE)
   ENDIF(NOT APPLE AND NOT WIN32 AND NOT BUILD_LITE_INTERPRETER)
 
+  IF(EXISTS "${MKLDNN_ROOT}/include/oneapi/dnnl/dnnl_ukernel.hpp")
+    IF(CPU_POWER OR CPU_RISCV)
+      SET(DNNL_EXPERIMENTAL_UKERNEL OFF CACHE BOOL "" FORCE)
+    ELSE()
+      MESSAGE("-- Will build oneDNN UKERNEL")
+      SET(DNNL_EXPERIMENTAL_UKERNEL ON CACHE BOOL "" FORCE)
+    ENDIF()
+  ENDIF(EXISTS "${MKLDNN_ROOT}/include/oneapi/dnnl/dnnl_ukernel.hpp")
+
   FIND_PACKAGE(BLAS)
   FIND_PATH(IDEEP_INCLUDE_DIR ideep.hpp PATHS ${IDEEP_ROOT} PATH_SUFFIXES include)
-  FIND_PATH(MKLDNN_INCLUDE_DIR dnnl.hpp dnnl.h PATHS ${MKLDNN_ROOT} PATH_SUFFIXES include/oneapi/dnnl)
+  FIND_PATH(MKLDNN_INCLUDE_DIR dnnl.hpp dnnl.h dnnl_ukernel.hpp dnnl_ukernel.h PATHS ${MKLDNN_ROOT} PATH_SUFFIXES include/oneapi/dnnl)
   IF(NOT MKLDNN_INCLUDE_DIR)
     MESSAGE("MKLDNN_INCLUDE_DIR not found")
     EXECUTE_PROCESS(COMMAND git${CMAKE_EXECUTABLE_SUFFIX} submodule update --init mkl-dnn WORKING_DIRECTORY ${IDEEP_ROOT})
-    FIND_PATH(MKLDNN_INCLUDE_DIR dnnl.hpp dnnl.h PATHS ${MKLDNN_ROOT} PATH_SUFFIXES include)
+    FIND_PATH(MKLDNN_INCLUDE_DIR dnnl.hpp dnnl.h dnnl_ukernel.hpp dnnl_ukernel.h PATHS ${MKLDNN_ROOT} PATH_SUFFIXES include)
   ENDIF(NOT MKLDNN_INCLUDE_DIR)
   IF(BUILD_ONEDNN_GRAPH)
     FIND_PATH(LLGA_INCLUDE_DIR dnnl_graph.hpp PATHS ${LLGA_ROOT} PATH_SUFFIXES include/oneapi/dnnl)

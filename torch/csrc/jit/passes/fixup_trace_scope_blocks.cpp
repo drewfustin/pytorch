@@ -2,15 +2,11 @@
 
 #include <c10/util/irange.h>
 #include <torch/csrc/jit/frontend/schema_matching.h>
-#include <torch/csrc/jit/passes/canonicalize.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
 #include <torch/csrc/jit/passes/inliner.h>
 #include <torch/csrc/jit/passes/lower_tuples.h>
 
-#include <algorithm>
-
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 namespace {
 
@@ -551,5 +547,4 @@ void FixupTraceScopeBlocks(std::shared_ptr<Graph>& graph, Module* self) {
   }
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

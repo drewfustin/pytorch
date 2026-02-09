@@ -1,13 +1,15 @@
 # mypy: allow-untyped-defs
-import warnings
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterator
 from enum import auto, Enum
 from functools import partial
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from typing import Any
 
 import torch
 import torch.nn as nn
 from torch.autograd.graph import save_on_cpu
 from torch.distributed.utils import _pack_kwargs, _replace_by_prefix, _unpack_kwargs
+from torch.utils._typing_utils import copy_method_params
 from torch.utils.checkpoint import checkpoint as torch_utils_checkpoint
 
 
@@ -20,7 +22,7 @@ class CheckpointImpl(Enum):
     NO_REENTRANT = auto()
 
 
-class ActivationWrapper(torch.nn.Module):
+class ActivationWrapper(torch.nn.Module, ABC):
     """
     Base class for Activation Checkpoint and Activation Offload.
 
@@ -35,10 +37,9 @@ class ActivationWrapper(torch.nn.Module):
         self._register_state_dict_hook(self._post_state_dict_hook)
         # load_state_dict pre-hook to allow loading back into
         # checkpoint-wrapped module.
-        self._register_load_state_dict_pre_hook(
-            self._pre_load_state_dict_hook, with_module=True
-        )
+        self.register_load_state_dict_pre_hook(self._pre_load_state_dict_hook)
 
+    @abstractmethod
     def forward(self, *args, **kwargs):
         raise ValueError("Subclasses should implement forward().")
 
@@ -53,11 +54,12 @@ class ActivationWrapper(torch.nn.Module):
         """Forward indexing calls in case the module is a nn.Sequential."""
         return self._checkpoint_wrapped_module.__getitem__(key)  # type: ignore[operator]
 
+    @copy_method_params(torch.nn.Module.named_parameters)
     def named_parameters(
         self,
         *args,
         **kwargs,
-    ) -> Iterator[Tuple[str, torch.nn.Parameter]]:
+    ) -> Iterator[tuple[str, torch.nn.Parameter]]:
         """
         Override :meth:`named_parameters()` to intercept parameter names.
 
@@ -69,10 +71,10 @@ class ActivationWrapper(torch.nn.Module):
     @staticmethod
     def _post_state_dict_hook(
         module: nn.Module,
-        state_dict: Dict[str, Any],
+        state_dict: dict[str, Any],
         prefix: str,
         *args: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         _post_state_dict_hook() is called after the state_dict() of this FSDP module is executed.
 
@@ -87,7 +89,7 @@ class ActivationWrapper(torch.nn.Module):
     @staticmethod
     def _pre_load_state_dict_hook(
         module: nn.Module,
-        state_dict: Dict[str, Any],
+        state_dict: dict[str, Any],
         prefix: str,
         *args: Any,
     ) -> None:
@@ -102,9 +104,6 @@ class ActivationWrapper(torch.nn.Module):
 
 
 class OffloadWrapper(ActivationWrapper):
-    def __init__(self, mod):
-        super().__init__(mod)
-
     def forward(self, *args, **kwargs):
         with save_on_cpu(pin_memory=True):
             return self._checkpoint_wrapped_module(*args, **kwargs)
@@ -229,15 +228,6 @@ def checkpoint_wrapper(
         (nn.Module):
             Wrapped module
     """
-
-    if checkpoint_impl == CheckpointImpl.REENTRANT:
-        warnings.warn(
-            f"Please specify {CheckpointImpl.NO_REENTRANT} as "
-            f"{CheckpointImpl.REENTRANT} will soon be removed as "
-            "the default and eventually deprecated.",
-            FutureWarning,
-            stacklevel=2,
-        )
     return CheckpointWrapper(
         module,
         checkpoint_impl,
@@ -250,7 +240,7 @@ def apply_activation_checkpointing(
     model,
     checkpoint_wrapper_fn=checkpoint_wrapper,
     check_fn=lambda _: True,
-    auto_wrap_policy: Optional[Callable[[nn.Module, bool, int], bool]] = None,
+    auto_wrap_policy: Callable[[nn.Module, bool, int], bool] | None = None,
 ):
     """
     Apply :func:`checkpoint_wrapper` to modules within `model` based on a user-defined configuration.

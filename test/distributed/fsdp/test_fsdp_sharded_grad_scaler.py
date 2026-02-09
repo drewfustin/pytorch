@@ -5,7 +5,7 @@ import functools
 import itertools
 import sys
 import unittest
-from typing import List, Optional
+from typing import Optional
 
 import torch
 from torch import distributed as dist
@@ -21,10 +21,10 @@ from torch.nn import TransformerDecoderLayer, TransformerEncoderLayer
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import (
-    CUDAInitMode,
+    DEVICEInitMode,
     DummyProcessGroup,
     FSDPInitMode,
-    FSDPTest,
+    FSDPTestContinuous,
     NestedWrappedModule,
     NonUniformReqGradNWM,
     subtest_name,
@@ -35,8 +35,10 @@ from torch.testing._internal.common_utils import (
     parametrize,
     run_tests,
     TEST_WITH_DEV_DBG_ASAN,
+    TEST_XPU,
     TestCase,
 )
+
 
 if not dist.is_available():
     print("Distributed not available, skipping tests", file=sys.stderr)
@@ -49,6 +51,8 @@ if TEST_WITH_DEV_DBG_ASAN:
         file=sys.stderr,
     )
     sys.exit(0)
+
+device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else "cpu"
 
 
 params = "cpu_offload,sharding_strategy,mixed_precision,use_orig_params"
@@ -75,11 +79,14 @@ subtest_name = functools.partial(subtest_name, test_name_mapping)
 
 class TestShardGradScaler(TestCase):
     @unittest.skipIf(
-        amp_definitely_not_available(), "no supported device (cuda, xla) found"
+        amp_definitely_not_available() and not TEST_XPU,
+        "no supported device (cuda, xla, xpu) found",
     )
     def test_grad_scaling(self):
         pg = DummyProcessGroup(0, 1)
-        scaler = ShardedGradScaler(init_scale=2.0, process_group=pg, enabled=True)
+        scaler = ShardedGradScaler(
+            device=device_type, init_scale=2.0, process_group=pg, enabled=True
+        )
         t0 = torch.full((1,), 4.0, dtype=torch.float32, device="cpu")
         t1 = torch.full((1,), 8.0, dtype=torch.float32, device="cpu")
         outputs = [t1.clone(), (t0.clone(), t1.clone()), [t0.clone(), t1.clone()]]
@@ -91,11 +98,14 @@ class TestShardGradScaler(TestCase):
         self.assertTrue(scaler._scale.device == t1.device)
 
     @unittest.skipIf(
-        amp_definitely_not_available(), "no supported device (cuda, xla) found"
+        amp_definitely_not_available() and not TEST_XPU,
+        "no supported device (cuda, xla, xpu) found",
     )
     def test_scaling_unscaling_sparse(self):
         pg = DummyProcessGroup(0, 1)
-        scaler = ShardedGradScaler(init_scale=2.0, process_group=pg, enabled=True)
+        scaler = ShardedGradScaler(
+            device=device_type, init_scale=2.0, process_group=pg, enabled=True
+        )
         inv_scale = torch.full((1,), 0.5, dtype=torch.float, device="cpu")
         found_inf = torch.full((1,), 0, dtype=torch.float, device="cpu")
 
@@ -136,11 +146,14 @@ class TestShardGradScaler(TestCase):
         self.assertEqual(found_inf, 1.0)
 
     @unittest.skipIf(
-        amp_definitely_not_available(), "no supported device (cuda, xla) found"
+        amp_definitely_not_available() and not TEST_XPU,
+        "no supported device (cuda, xla, xpu) found",
     )
     def test_inf_gradients_skip_optim_step(self):
         pg = DummyProcessGroup(0, 1)
-        scaler = ShardedGradScaler(init_scale=2.0, process_group=pg, enabled=True)
+        scaler = ShardedGradScaler(
+            device=device_type, init_scale=2.0, process_group=pg, enabled=True
+        )
         loss = torch.full((1,), 4.0, dtype=torch.float32, device="cpu")
         t0 = torch.tensor([float("inf")], dtype=torch.float32, device="cpu")
         t0.grad = t0.clone()
@@ -150,15 +163,15 @@ class TestShardGradScaler(TestCase):
         self.assertTrue(ret_val is None)
 
 
-class TestShardedGradScalerParityWithDDP(FSDPTest):
+class TestShardedGradScalerParityWithDDP(FSDPTestContinuous):
     def _get_init_modes_for_test(self, cpu_offload):
-        modes = [CUDAInitMode.CUDA_AFTER, CUDAInitMode.CUDA_BEFORE]
-        # Note that CUDAInitMode.CUDA_NEVER works currently only with CPU
+        modes = [DEVICEInitMode.DEVICE_AFTER, DEVICEInitMode.DEVICE_BEFORE]
+        # Note that DEVICEInitMode.DEVICE_NEVER works currently only with CPU
         # offload as we explicitly bring the param back to CUDA device. In
         # general, it will not work since we try to all_gather p.data which is
         # on CPU but NCCL only supports GPU.
         if cpu_offload.offload_params:
-            modes.append(CUDAInitMode.CUDA_NEVER)
+            modes.append(DEVICEInitMode.DEVICE_NEVER)
 
         return modes
 
@@ -191,11 +204,11 @@ class TestShardedGradScalerParityWithDDP(FSDPTest):
             use_orig = False
             model_cls = NestedWrappedModule  # type: ignore[assignment]
             sharded_grad_scaler_kwargs = None
-        for cuda_init_mode in init_modes:
+        for device_init_mode in init_modes:
             self._test_fsdp_parity(
                 model_cls,
                 FSDPInitMode.RECURSIVE,
-                cuda_init_mode=cuda_init_mode,
+                device_init_mode=device_init_mode,
                 cpu_offload=cpu_offload,
                 sharding_strategy=sharding_strategy,
                 mixed_precision=mp,
@@ -212,7 +225,7 @@ class TestShardedGradScalerParityWithDDP(FSDPTest):
         model = TransformerWithSharedParams.init(
             self.process_group,
             FSDPInitMode.NO_FSDP,
-            CUDAInitMode.CUDA_BEFORE,
+            DEVICEInitMode.DEVICE_BEFORE,
             deterministic=True,
         )
         ref_model = DDP(
@@ -227,8 +240,9 @@ class TestShardedGradScalerParityWithDDP(FSDPTest):
                 {
                     TransformerEncoderLayer,
                     TransformerDecoderLayer,
-                }
+                },
             ),
+            "device_id": self.rank,
         }
         model = FSDP(model, **fsdp_kwargs)
         optim = torch.optim.Adam(model.parameters(), lr=1e-2)
@@ -256,10 +270,10 @@ class TestShardedGradScalerParityWithDDP(FSDPTest):
             cpu_offload=cpu_offload,
             use_orig_params=use_orig_params,
         )
-        grad_scaler = ShardedGradScaler(init_scale=2.0)
-        ref_grad_scaler = torch.amp.GradScaler(device="cuda", init_scale=2.0)
-        scaled_losses: List[torch.Tensor] = []
-        device = torch.device("cuda")
+        grad_scaler = ShardedGradScaler(device=device_type, init_scale=2.0)
+        ref_grad_scaler = torch.amp.GradScaler(device=device_type, init_scale=2.0)
+        scaled_losses: list[torch.Tensor] = []
+        device = torch.device(device_type)
         torch.manual_seed(42 + self.rank + 1)
 
         for iter in range(10):

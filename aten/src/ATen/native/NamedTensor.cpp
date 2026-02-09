@@ -31,12 +31,12 @@
 
 namespace at::native {
 
-Tensor& rename_(Tensor& self, optional<DimnameList> names) {
+Tensor& rename_(Tensor& self, std::optional<DimnameList> names) {
   at::internal_set_names_inplace(self, names);
   return self;
 }
 
-Tensor rename(const Tensor& self, optional<DimnameList> names) {
+Tensor rename(const Tensor& self, std::optional<DimnameList> names) {
   auto result = self.alias();
   at::internal_set_names_inplace(result, names);
   return result;
@@ -60,8 +60,10 @@ static void report_moving_unnamed_dim_error(
 static void report_not_a_subsequence_error(
     DimnameList names, DimnameList other, bool is_aligning_two_tensors) {
   if (is_aligning_two_tensors) {
+#ifndef STRIP_ERROR_MESSAGES
     auto shorter = names.size() > other.size() ? other : names;
     auto longer = names.size() > other.size() ? names : other;
+#endif
     TORCH_CHECK(false,
         "Could not align Tensor", shorter, " and Tensor", longer,
         " because ", shorter, " is not a subsequence of ", longer, ". ");
@@ -82,8 +84,8 @@ static std::vector<int64_t> aligned_size(
     DimnameList aligned_names,
     bool is_aligning_two_tensors) {
   std::vector<int64_t> expanded_sizes(aligned_names.size(), 1);
-  ptrdiff_t dim = (ptrdiff_t)tensor_sizes.size() - 1;
-  ptrdiff_t idx = (ptrdiff_t)aligned_names.size() - 1;
+  ptrdiff_t dim = static_cast<ptrdiff_t>(tensor_sizes.size()) - 1;
+  ptrdiff_t idx = static_cast<ptrdiff_t>(aligned_names.size()) - 1;
   for (; idx >= 0 && dim >= 0; --idx) {
     if (tensor_names[dim] != aligned_names[idx]) {
       continue;
@@ -161,7 +163,7 @@ static Tensor align(const Tensor& tensor, DimnameList names, bool is_aligning_tw
         tensor.names(),
         names,
         is_aligning_two_tensors);
-  auto result = tensor.rename(nullopt).view(expanded_sizes);
+  auto result = tensor.rename(std::nullopt).view(expanded_sizes);
   at::internal_set_names_inplace(result, names);
   return result;
 }

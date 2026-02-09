@@ -6,8 +6,6 @@
 #include <caffe2/serialize/read_adapter_interface.h>
 
 #include <torch/csrc/jit/api/compilation_unit.h>
-#include <torch/csrc/jit/serialization/import.h>
-#include <torch/csrc/jit/serialization/source_range_serialization.h>
 
 #include <ATen/core/functional.h>
 #include <ATen/core/ivalue_inl.h>
@@ -21,6 +19,7 @@
 #include <torch/csrc/jit/operator_upgraders/upgraders_entry.h>
 #include <torch/csrc/jit/passes/shape_analysis.h>
 #include <torch/csrc/jit/passes/subgraph_rewrite.h>
+#include <torch/csrc/jit/serialization/import.h>
 #include <torch/csrc/jit/serialization/import_export_helpers.h>
 #include <torch/csrc/jit/serialization/import_read.h>
 #include <torch/csrc/jit/serialization/import_source.h>
@@ -31,7 +30,6 @@
 #include <fmt/format.h>
 
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -46,7 +44,9 @@ static void postSetStateValidate(const IValue& v) {
   const auto& objType = obj->type();
   for (const auto i : c10::irange(objType->numAttributes())) {
     const auto& attrType = objType->getAttribute(i);
+#ifndef STRIP_ERROR_MESSAGES
     const auto& attrName = objType->getAttributeName(i);
+#endif
     const auto& slot = obj->getSlot(i);
     // const auto attrType = objType->getAttribute(i);
     // Verify that all the non-optional attributes have been initialized
@@ -71,15 +71,15 @@ static void postSetStateValidate(const IValue& v) {
 c10::intrusive_ptr<c10::ivalue::Object> ObjLoaderFunc(
     const at::StrongTypePtr& type,
     IValue input) {
-  auto cls = type.type_->expect<at::ClassType>();
-  auto qn = cls->name();
-  size_t n = cls->numAttributes();
+  const auto& cls = type.type_->expectRef<at::ClassType>();
+  auto qn = cls.name();
+  size_t n = cls.numAttributes();
   if (checkHasValidSetGetState(cls)) {
     auto obj = c10::ivalue::Object::create(type, n);
     // XXX: Do not optimize __setstate__, so that we don't try to
     // specialize the class before it is initialized.
     GraphOptimizerEnabledGuard guard(false);
-    Function& set_state = cls->getMethod("__setstate__");
+    Function& set_state = cls.getMethod("__setstate__");
     // since we are in the middle of unpickling we might still have lists and
     // dicts that do not have accurate tags (e.g. they report they are
     // List[Any]). But we need to run __setstate__ which will check the input
@@ -96,7 +96,7 @@ c10::intrusive_ptr<c10::ivalue::Object> ObjLoaderFunc(
     auto dict = std::move(input).toGenericDict();
     auto obj = c10::ivalue::Object::create(type, n);
     for (const auto i : c10::irange(n)) {
-      obj->setSlot(i, dict.at(cls->getAttributeName(i)));
+      obj->setSlot(i, dict.at(cls.getAttributeName(i)));
     }
     return obj;
   }
@@ -117,8 +117,7 @@ class ScriptModuleDeserializer final {
       : compilation_unit_(std::move(cu)),
         reader_(std::move(reader)),
         code_prefix_("code/"),
-        pickle_dir_prefix_(""),
-        tensor_dir_prefix_(""),
+
         source_importer_(
             compilation_unit_,
             &constants_table_,
@@ -264,7 +263,7 @@ Module ScriptModuleDeserializer::deserialize(
     }
   }
   if (reader_->hasRecord("model.json") && code_prefix_ == "code/") {
-    AT_ERROR("Legacy model format is not supported on mobile.");
+    TORCH_CHECK(false, "Legacy model format is not supported on mobile.");
   }
   auto tuple = readArchive("constants").toTuple();
   for (auto constant : tuple->elements()) {

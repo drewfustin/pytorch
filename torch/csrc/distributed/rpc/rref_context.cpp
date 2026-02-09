@@ -4,9 +4,7 @@
 
 #include <sstream>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
 thread_local std::vector<std::shared_ptr<RRefContext::PendingUserState>>
     RRefContext::userTable_;
@@ -138,7 +136,7 @@ std::unordered_map<std::string, std::string> RRefContext::getDebugInfo() {
   std::unique_lock<std::mutex> lock(mutex_);
   auto ownerSize = owners_.size();
   auto numPendingUsers = pendingUsers_.size();
-  int numForks = 0;
+  size_t numForks = 0;
   for (const auto& owner : forks_) {
     numForks += owner.second.size();
   }
@@ -156,8 +154,7 @@ void RRefContext::checkRRefLeaks(bool ignoreRRefLeak) {
     for (auto& entry : forks_) {
       const RRefId& rrefId = entry.first;
       for (const auto& forkId : entry.second) {
-        ss << "Leaking RRef " << rrefId << " with fork Id " << forkId
-           << std::endl;
+        ss << "Leaking RRef " << rrefId << " with fork Id " << forkId << '\n';
       }
     }
 
@@ -351,7 +348,7 @@ c10::intrusive_ptr<OwnerRRef> RRefContext::getOrCreateOwnerRRef(
     // here is a plain TensorType, they are not equal relationship:
     // specialized TensorType <: plain TensorType
     //
-    // In RPC we don't care the difference as we ser/de with just the
+    // In RPC we don't care the difference as we Ser/De with just the
     // plain TensorType. This is not a issue for UserRRef creation either,
     // since Tensor can only get specialized with a previous run of local
     // JIT function, and we shouldn't preserve the specialized SubTensorType
@@ -803,6 +800,4 @@ c10::intrusive_ptr<RRef> RRefContext::delForkOfOwner(
   return deletedRRef;
 }
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc

@@ -9,6 +9,7 @@ from sympy.core.parameters import global_parameters
 from sympy.core.singleton import S, Singleton
 
 
+# pyrefly: ignore [invalid-inheritance]
 class IntInfinity(Number, metaclass=Singleton):
     r"""Positive integer infinite quantity.
 
@@ -41,7 +42,7 @@ class IntInfinity(Number, metaclass=Singleton):
     def __new__(cls):
         return AtomicExpr.__new__(cls)
 
-    def _sympystr(self, printer):
+    def _sympystr(self, printer) -> str:
         return "int_oo"
 
     def _eval_subs(self, old, new):
@@ -60,8 +61,8 @@ class IntInfinity(Number, metaclass=Singleton):
     @_sympifyit("other", NotImplemented)
     def __add__(self, other):
         if isinstance(other, Number) and global_parameters.evaluate:
-            if other is S.NegativeInfinity:
-                return S.NegativeInfinity
+            if other in (S.Infinity, S.NegativeInfinity):
+                return other
             if other in (S.NegativeIntInfinity, S.NaN):
                 return S.NaN
             return self
@@ -74,6 +75,8 @@ class IntInfinity(Number, metaclass=Singleton):
         if isinstance(other, Number) and global_parameters.evaluate:
             if other is S.Infinity:
                 return S.NegativeInfinity
+            if other is S.NegativeInfinity:
+                return S.Infinity
             if other in (S.IntInfinity, S.NaN):
                 return S.NaN
             return self
@@ -201,6 +204,25 @@ class IntInfinity(Number, metaclass=Singleton):
 int_oo = S.IntInfinity
 
 
+def is_infinite(expr) -> bool:
+    """Check if an expression is any type of infinity (positive or negative).
+
+    This handles both sympy's built-in infinities (oo, -oo) and PyTorch's
+    integer infinities (int_oo, -int_oo).
+
+    Note: We cannot rely on sympy's is_finite property because IntInfinity
+    and NegativeIntInfinity have is_integer=True, which implies is_finite=True
+    in sympy's assumption system.
+    """
+    return expr in (
+        S.Infinity,
+        S.NegativeInfinity,
+        S.IntInfinity,
+        S.NegativeIntInfinity,
+    )
+
+
+# pyrefly: ignore [invalid-inheritance]
 class NegativeIntInfinity(Number, metaclass=Singleton):
     """Negative integer infinite quantity.
 
@@ -233,7 +255,7 @@ class NegativeIntInfinity(Number, metaclass=Singleton):
         if self == old:
             return new
 
-    def _sympystr(self, printer):
+    def _sympystr(self, printer) -> str:
         return "-int_oo"
 
     """

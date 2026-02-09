@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import json
 import logging
 import math
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING
 
 import torchgen.api.cpp as cpp
 from torchgen.context import native_function_manager
@@ -21,11 +23,15 @@ from torchgen.model import (
 from torchgen.static_runtime import config
 
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+
 logger: logging.Logger = logging.getLogger()
 
 
 def has_alias(
-    arguments: Sequence[Union[Argument, SelfArgument, TensorOptionsArguments]]
+    arguments: Sequence[Argument | SelfArgument | TensorOptionsArguments],
 ) -> bool:
     for arg in arguments:
         annotation = getattr(arg, "annotation", None)
@@ -237,7 +243,7 @@ BLOCKED_OPS = frozenset(
 )
 
 
-def is_supported(g: Union[NativeFunctionsGroup, NativeFunctionsViewGroup]) -> bool:
+def is_supported(g: NativeFunctionsGroup | NativeFunctionsViewGroup) -> bool:
     base_op_name = ""
     func = None
     if isinstance(g, NativeFunctionsViewGroup):
@@ -298,8 +304,8 @@ def is_supported(g: Union[NativeFunctionsGroup, NativeFunctionsViewGroup]) -> bo
 
 
 def ivalue_type_conversion_method(
-    arg_type: Union[BaseType, OptionalType, Type]
-) -> Optional[Tuple[bool, str]]:
+    arg_type: BaseType | OptionalType | Type,
+) -> tuple[bool, str] | None:
     """
     Return the method call expression of `c10::ivalue' to convert its contained value to
     the expected value of `arg_type` type. For example, for `arg_type` == BaseTy.Tensor,
@@ -318,6 +324,7 @@ def ivalue_type_conversion_method(
         BaseTy.str: (
             (False, "toStringView()"),
             (False, "toOptional<c10::string_view>()"),
+            (False, "toOptional<::std::string_view>()"),
         ),
     }
 
@@ -394,7 +401,7 @@ def test_tensor_dim(op_name: str) -> int:
 
 
 test_tensor_shapes_string = '{"view_as_complex": "{2, 2}"}'
-test_tensor_shape_json: Dict[str, str] = json.loads(test_tensor_shapes_string)
+test_tensor_shape_json: dict[str, str] = json.loads(test_tensor_shapes_string)
 
 
 def test_tensor_shape(op_name: str) -> str:
@@ -405,7 +412,7 @@ def test_tensor_shape(op_name: str) -> str:
 
 
 def test_value_expression(
-    arg_type: Union[BaseType, OptionalType, Type], index: int, op_name: str
+    arg_type: BaseType | OptionalType | Type, index: int, op_name: str
 ) -> str:
     tensor_size_ex = test_tensor_shape(op_name)
     if tensor_size_ex == "":
@@ -434,17 +441,22 @@ def test_value_expression(
     if isinstance(arg_type, BaseType):
         base_ty_object = arg_type.name
     else:
-        assert isinstance(arg_type, OptionalType) and isinstance(
-            arg_type.elem, BaseType
-        )
+        if not (
+            isinstance(arg_type, OptionalType) and isinstance(arg_type.elem, BaseType)
+        ):
+            raise AssertionError(
+                f"Expected OptionalType with BaseType elem, got {type(arg_type)}"
+            )
         base_ty_object = arg_type.elem.name
-    assert base_ty_object in value_expressions, "not expected type"
+    if base_ty_object not in value_expressions:
+        raise AssertionError(f"Unexpected type: {base_ty_object}")
     value_expression = value_expressions[base_ty_object]
     return value_expression
 
 
 def generate_test_value_definitions(schema: FunctionSchema, index: int) -> str:
-    assert not schema.is_out_fn()
+    if schema.is_out_fn():
+        raise AssertionError(f"Expected non-out function, got {schema}")
     schema_name = schema.name.name.base
     arg_map = {}
     for arg in schema.schema_order_arguments():
@@ -458,7 +470,8 @@ def generate_test_value_definitions(schema: FunctionSchema, index: int) -> str:
 
 
 def generate_test_value_names(schema: FunctionSchema, index: int) -> str:
-    assert not schema.is_out_fn()
+    if schema.is_out_fn():
+        raise AssertionError(f"Expected non-out function, got {schema}")
     return ",".join(f"{arg.name}{index}" for arg in schema.schema_order_arguments())
 
 
@@ -475,14 +488,15 @@ generate_test_ir_arguments_base_ty_to_type_str_ = {
 
 def generate_test_ir_arguments(
     schema: FunctionSchema,
-) -> List[Tuple[str, Optional[str]]]:
-    def ir_argument(arg: Argument) -> Tuple[str, Optional[str]]:
+) -> list[tuple[str, str | None]]:
+    def ir_argument(arg: Argument) -> tuple[str, str | None]:
         t = arg.type
         add_optional = False
         if isinstance(t, OptionalType):
             t = t.elem
             add_optional = True
-        assert isinstance(t, BaseType)
+        if not isinstance(t, BaseType):
+            raise AssertionError(f"Expected BaseType, got {type(t)}")
         type_str = None
         if t.name in generate_test_ir_arguments_base_ty_to_type_str_:
             type_str = generate_test_ir_arguments_base_ty_to_type_str_[t.name]
@@ -497,7 +511,10 @@ def generate_arg_extraction(schema: FunctionSchema) -> str:
     arg_populations = []
     for i, arg in enumerate(schema.schema_order_arguments()):
         maybe_method = ivalue_type_conversion_method(arg.type)
-        assert maybe_method
+        if not maybe_method:
+            raise AssertionError(
+                f"No type conversion method for {arg.name}: {arg.type}"
+            )
         is_reference, type_conversion_method = maybe_method
         reference = "&" if is_reference else ""
         arg_populations.append(
@@ -524,11 +541,12 @@ def generate_non_out_variant_call(
     g: NativeFunctionsGroup, backend_index: BackendIndex
 ) -> str:
     schema = g.functional.func
-    assert not schema.is_out_fn()
+    if schema.is_out_fn():
+        raise AssertionError(f"Expected non-out function, got {schema}")
     kernel_name = get_kernel_name(g, backend_index)
     arg_names = (arg.name for arg in schema.schema_order_arguments())
     namespace_name = "cpu" if g.structured else "native"
-    return f'at::{namespace_name}::{kernel_name}({",".join(arg_names)})'
+    return f"at::{namespace_name}::{kernel_name}({','.join(arg_names)})"
 
 
 def generate_call_to_view_ops(
@@ -541,14 +559,15 @@ def generate_call_to_view_ops(
         kernel_name = kernel.kernel
     arg_names = (arg.name for arg in schema.schema_order_arguments())
     namespace_name = "native"
-    return f'at::{namespace_name}::{kernel_name}({",".join(arg_names)})'
+    return f"at::{namespace_name}::{kernel_name}({','.join(arg_names)})"
 
 
 def generate_out_variant_call(
     g: NativeFunctionsGroup, backend_index: BackendIndex
 ) -> str:
     schema = g.out.func
-    assert schema.is_out_fn()
+    if not schema.is_out_fn():
+        raise AssertionError(f"Expected out function, got {schema}")
     arg_names = []
     kernel_name = get_out_kernel_name(g, backend_index)
     if g.structured:
@@ -560,10 +579,14 @@ def generate_out_variant_call(
         if isinstance(arg, SelfArgument):
             arg_names.append(arg.argument.name)
         else:
-            assert isinstance(arg, Argument)
+            if not isinstance(arg, Argument):
+                raise AssertionError(f"Expected Argument, got {type(arg)}")
             arg_names.append(arg.name)
     if not g.structured:
-        assert len(schema.arguments.out) == 1
+        if len(schema.arguments.out) != 1:
+            raise AssertionError(
+                f"Expected 1 out argument, got {len(schema.arguments.out)}"
+            )
         arg_names.append(schema.arguments.out[0].name)
     cpp_arg_names = ",".join(arg_names)
     namespace_name = "cpu" if g.structured else "native"
@@ -607,8 +630,12 @@ class GenOpDispatcher:
         generated_type_variants = []
         for g in groups:
             with native_function_manager(g):
-                assert is_supported(g)
-                assert isinstance(g, NativeFunctionsGroup)
+                if not is_supported(g):
+                    raise AssertionError(f"Unsupported function group: {g}")
+                if not isinstance(g, NativeFunctionsGroup):
+                    raise AssertionError(
+                        f"Expected NativeFunctionsGroup, got {type(g)}"
+                    )
                 generated_type_variant = self.out_variant_op_generator(g, backend_index)
                 generated_type_variants.append(generated_type_variant)
         op_name = op_name_from_group(groups[0])
@@ -621,7 +648,7 @@ REGISTER_OPERATOR_FUNCTOR(
       {body}
       LogAndDumpSchema(n);
       return nullptr;
-    }});
+    }})
 """
         return generated
 
@@ -633,8 +660,12 @@ REGISTER_OPERATOR_FUNCTOR(
         generated_type_variants = []
         for g in groups:
             with native_function_manager(g):
-                assert is_supported(g)
-                assert isinstance(g, NativeFunctionsViewGroup)
+                if not is_supported(g):
+                    raise AssertionError(f"Unsupported view group: {g}")
+                if not isinstance(g, NativeFunctionsViewGroup):
+                    raise AssertionError(
+                        f"Expected NativeFunctionsViewGroup, got {type(g)}"
+                    )
                 generated_type_variant = self.view_op_generator(g, backend_index)
                 generated_type_variants.append(generated_type_variant)
         op_name = config.func_name_base_str(groups[0])
@@ -658,7 +689,10 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
         schema = str(functional.func)
         populated_argument = generate_arg_extraction(g.functional.func)
         functional_variant_call = generate_non_out_variant_call(g, backend_index)
-        assert len(g.out.func.arguments.out) == 1
+        if len(g.out.func.arguments.out) != 1:
+            raise AssertionError(
+                f"Expected 1 out argument, got {len(g.out.func.arguments.out)}"
+            )
         out_variable_name = str(g.out.func.arguments.out[0].name)
         out_variant_call = generate_out_variant_call(g, backend_index)
         generated = f"""
@@ -699,8 +733,12 @@ class GenOpTestCase:
         generated_type_variants = []
         for g in groups:
             with native_function_manager(g):
-                assert is_supported(g)
-                assert isinstance(g, NativeFunctionsGroup)
+                if not is_supported(g):
+                    raise AssertionError(f"Unsupported function group: {g}")
+                if not isinstance(g, NativeFunctionsGroup):
+                    raise AssertionError(
+                        f"Expected NativeFunctionsGroup, got {type(g)}"
+                    )
                 generated_type_variant = self.out_variant_op_test_case_generator(g)
                 generated_type_variants.append(generated_type_variant)
         return "\n".join(generated_type_variants)
@@ -711,8 +749,12 @@ class GenOpTestCase:
         generated_type_variants = []
         for g in groups:
             with native_function_manager(g):
-                assert is_supported(g)
-                assert isinstance(g, NativeFunctionsViewGroup)
+                if not is_supported(g):
+                    raise AssertionError(f"Unsupported view group: {g}")
+                if not isinstance(g, NativeFunctionsViewGroup):
+                    raise AssertionError(
+                        f"Expected NativeFunctionsViewGroup, got {type(g)}"
+                    )
                 generated_type_variant = self.view_op_test_case_generator(g)
                 generated_type_variants.append(generated_type_variant)
         return "\n".join(generated_type_variants)
@@ -720,10 +762,14 @@ class GenOpTestCase:
     def out_variant_op_test_case_generator(self, g: NativeFunctionsGroup) -> str:
         schema = g.functional.func
         schema_str = str(schema)
-        assert schema_str.find("(") > 0
+        if schema_str.find("(") <= 0:
+            raise AssertionError(f"Invalid schema string: {schema_str}")
         type_variant_op_name = schema_str[: schema_str.find("(")].replace(".", "_")
         op_name = op_name_from_group(g)
-        assert type_variant_op_name.startswith(op_name)
+        if not type_variant_op_name.startswith(op_name):
+            raise AssertionError(
+                f"Type variant op name {type_variant_op_name} doesn't start with {op_name}"
+            )
 
         arg_types = generate_test_ir_arguments(schema)
         arg_declarations = ", ".join(
@@ -733,11 +779,12 @@ class GenOpTestCase:
             )
         )
         arg_names = ", ".join((arg_name for arg_name, _ in arg_types))
-        assert (
+        if not (
             len(schema.returns) == 1
             and isinstance(schema.returns[0].type, BaseType)
             and schema.returns[0].type.name is BaseTy.Tensor
-        )
+        ):
+            raise AssertionError(f"Expected single Tensor return, got {schema.returns}")
         test_value_definitions = generate_test_value_definitions(schema, 0)
         test_value_names = generate_test_value_names(schema, 0)
         test_value_definitions2 = generate_test_value_definitions(schema, 1)
@@ -768,10 +815,14 @@ TEST(StaticRuntime, autogen_{type_variant_op_name}) {{
     def view_op_test_case_generator(self, g: NativeFunctionsViewGroup) -> str:
         schema = g.view.func
         schema_str = str(schema)
-        assert schema_str.find("(") > 0
+        if schema_str.find("(") <= 0:
+            raise AssertionError(f"Invalid schema string: {schema_str}")
         type_variant_op_name = schema_str[: schema_str.find("(")].replace(".", "_")
         op_name = g.view.root_name
-        assert type_variant_op_name.startswith(op_name)
+        if not type_variant_op_name.startswith(op_name):
+            raise AssertionError(
+                f"Type variant op name {type_variant_op_name} doesn't start with {op_name}"
+            )
 
         arg_types = generate_test_ir_arguments(schema)
         arg_declarations = ", ".join(
@@ -781,11 +832,12 @@ TEST(StaticRuntime, autogen_{type_variant_op_name}) {{
             )
         )
         arg_names = ", ".join((arg_name for arg_name, _ in arg_types))
-        assert (
+        if not (
             len(schema.returns) == 1
             and isinstance(schema.returns[0].type, BaseType)
             and schema.returns[0].type.name is BaseTy.Tensor
-        )
+        ):
+            raise AssertionError(f"Expected single Tensor return, got {schema.returns}")
         test_value_definitions = generate_test_value_definitions(schema, 0)
         test_value_names = generate_test_value_names(schema, 0)
         generated = f"""

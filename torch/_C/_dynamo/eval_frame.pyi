@@ -1,27 +1,91 @@
-# mypy: allow-untyped-defs
+import enum
 import types
-from typing import List, NewType, Optional
+from collections.abc import Callable
+from typing import Optional, overload
 
-from torch._dynamo.types import DynamoCallback, DynamoGuardHook
-
-# We implement our own FrameType-like type for Python >= 3.11. So it's not actually an alias of FrameType, but still
-# exposes the same interface.
-_PyInterpreterFrame = NewType("_PyInterpreterFrame", types.FrameType)
+from torch._dynamo.guards import GuardManagerWrapper
+from torch._dynamo.types import DynamoCallback, DynamoGuardCompleteHook, DynamoGuardHook
+from torch._guards import CompileId
 
 def set_eval_frame(callback: DynamoCallback) -> DynamoCallback: ...
+def set_skip_guard_eval_unsafe(value: bool) -> bool: ...
+def get_eval_frame_callback() -> DynamoCallback: ...
 def reset_code(code: types.CodeType) -> None: ...
 def unsupported(obj1: object, obj2: object) -> object: ...
-def skip_code(code: types.CodeType) -> None: ...
+def set_code_exec_strategy(
+    code: types.CodeType, strategy: _FrameExecStrategy
+) -> None: ...
 def set_guard_error_hook(hook: DynamoGuardHook) -> None: ...
+def set_guard_complete_hook(
+    hook: Optional[DynamoGuardCompleteHook],
+) -> Optional[DynamoGuardCompleteHook]: ...
+def raise_sigtrap() -> None: ...
+def set_c_recursion_limit(limit: int) -> None: ...
+def get_c_recursion_limit() -> int: ...
 
 class _CacheEntry:
-    def check_fn(self, *args, **kwargs): ...
+    def check_fn(self, *args: object, **kwargs: object) -> bool: ...
+    def update_diff_guard_root_manager(self) -> None: ...
     code: types.CodeType
-    next: Optional[_CacheEntry]
+    compile_id: CompileId
+    # If we run into circular issues, just use object
+    guard_manager: GuardManagerWrapper
+    backend: Callable
+    next: _CacheEntry | None
+
+class _PrecompileEntry:
+    guard_manager: GuardManagerWrapper
 
 class _ExtraState:
-    def invalidate(self, cache_entry: _CacheEntry): ...
+    def invalidate(
+        self, cache_entry: _CacheEntry, guard_manager: GuardManagerWrapper
+    ) -> None: ...
 
-def _debug_get_cache_entry_list(code: types.CodeType) -> List[_CacheEntry]: ...
+class _FrameAction(enum.IntEnum):
+    DEFAULT = 0
+    SKIP = 1
+    RUN_ONLY = 2
 
-py_opcode_caches: List[int]
+class _FrameExecStrategy:
+    cur_action: _FrameAction
+    recursive_action: _FrameAction
+
+    @overload
+    def __init__(self) -> None: ...
+    @overload
+    def __init__(
+        self, cur_action: _FrameAction, recursive_action: _FrameAction
+    ) -> None: ...
+
+# This is an object that encapsulates the Python FrameType, and exposes
+# properties Dynamo cares about for a frame.
+class _PyInterpreterFrame:
+    f_code: types.CodeType
+    f_locals: dict[str, object]
+    f_globals: dict[str, object]
+    f_builtins: dict[str, object]
+    f_lasti: int
+    f_lineno: int
+    f_back: types.FrameType
+    # A tuple containing cell objects captured by this frame.
+    closure: tuple[types.CellType]
+
+def _debug_get_cache_entry_list(code: types.CodeType) -> list[_CacheEntry]: ...
+
+py_opcode_caches: list[int]
+
+def code_framelocals_names(code: types.CodeType) -> tuple[str, ...]: ...
+def _load_precompile_entry(
+    code: types.CodeType,
+    guard_manager: GuardManagerWrapper,
+    dynamo_code: types.CodeType,
+) -> None: ...
+def _reset_precompile_entries(code: types.CodeType) -> None: ...
+def _debug_get_precompile_entries(code: types.CodeType) -> list[_PrecompileEntry]: ...
+
+class _EvalFrameOverride(enum.IntEnum):
+    NONE = 0
+    SKIP = 1
+    ERROR = 2
+
+def set_eval_frame_override(override: _EvalFrameOverride) -> _EvalFrameOverride: ...

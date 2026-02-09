@@ -30,10 +30,14 @@
 
 #include <thrust/binary_search.h>
 #include <thrust/device_ptr.h>
+#include <thrust/distance.h>
+#include <thrust/for_each.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/iterator/discard_iterator.h>
+#include <thrust/scan.h>
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
-#include <thrust/system/cuda/execution_policy.h>
-#include <thrust/iterator/constant_iterator.h>
+#include <thrust/transform.h>
 
 #include <cuda_runtime_api.h>
 #include <cusparse.h>
@@ -45,21 +49,6 @@
 #include <ATen/native/cuda/Loops.cuh>
 
 #include <c10/macros/Macros.h>
-#include <thrust/copy.h>
-#include <thrust/device_ptr.h>
-#include <thrust/for_each.h>
-#include <thrust/functional.h>
-#include <thrust/gather.h>
-#include <thrust/generate.h>
-#include <thrust/iterator/discard_iterator.h>
-#include <thrust/reduce.h>
-#include <thrust/scan.h>
-#include <thrust/sequence.h>
-#include <thrust/sort.h>
-#include <thrust/transform.h>
-#include <thrust/unique.h>
-
-#include <c10/cuda/CUDAMathCompat.h>
 
 namespace at::native {
 namespace {
@@ -304,7 +293,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> compute_pool_max(
   int64_t* offsets_ptr = offsets.data_ptr<int64_t>();
 
   auto sorted_indices = at::empty({nnz}, indices.options());
-  thrust_ptr sorted_indices_thrust_ptr(sorted_indices.data_ptr<int64_t>());
+  thrust_ptr sorted_indices_thrust_ptr(sorted_indices.template data_ptr<int64_t>());
   thrust::sequence(
       policy, sorted_indices_thrust_ptr, sorted_indices_thrust_ptr + nnz, 0);
 
@@ -323,17 +312,17 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> compute_pool_max(
       sorted_indices_thrust_ptr + nnz,
       thrust::make_constant_iterator(int64_t(1)),
       thrust::make_discard_iterator(),
-      thrust_ptr(pool_sizes.data_ptr<int64_t>()),
+      thrust_ptr(pool_sizes.template data_ptr<int64_t>()),
       [offsets_ptr] __device__(int64_t x, int64_t y) {
         return offsets_ptr[x] == offsets_ptr[y];
       });
   auto new_sz = thrust::distance(
-      thrust_ptr(pool_sizes.data_ptr<int64_t>()), new_end.second);
+      thrust_ptr(pool_sizes.template data_ptr<int64_t>()), new_end.second);
   pool_sizes.resize_({new_sz});
 
   auto pool_offsets = pool_sizes.clone();
   thrust_ptr pool_offsets_thrust_ptr(
-      pool_offsets.data_ptr<int64_t>());
+      pool_offsets.template data_ptr<int64_t>());
   thrust::exclusive_scan(
       policy,
       pool_offsets_thrust_ptr,
@@ -350,9 +339,9 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> compute_pool_max(
 
     auto mx_buffer_ptr = mx_buffer.data_ptr<scalar_t>();
 
-    auto pool_sizes_ptr = pool_sizes.data_ptr<int64_t>();
-    auto sorted_indices_ptr = sorted_indices.data_ptr<int64_t>();
-    auto pool_offsets_ptr = pool_offsets.data_ptr<int64_t>();
+    auto pool_sizes_ptr = pool_sizes.template data_ptr<int64_t>();
+    auto sorted_indices_ptr = sorted_indices.template data_ptr<int64_t>();
+    auto pool_offsets_ptr = pool_offsets.template data_ptr<int64_t>();
 
     thrust::for_each(
         policy,
@@ -424,12 +413,7 @@ void cuda_sparse_coo_softmax(
   auto out_values_2 = out_values.view({nnz, nvalues});
   auto out_values_accessor = out_values_2.packed_accessor64<scalar_t, 2>();
 
-  Tensor sorted_indices;
-  Tensor pool_offsets;
-  Tensor pool_sizes;
-  Tensor mx_buffer;
-
-  std::tie(sorted_indices, pool_offsets, pool_sizes, mx_buffer) =
+  auto [sorted_indices, pool_offsets, pool_sizes, mx_buffer] =
       compute_pool_max<scalar_t, true>(indices, values_2, sizes, nvalues, dim);
 
   auto pool_size = pool_offsets.size(0);
@@ -443,12 +427,12 @@ void cuda_sparse_coo_softmax(
   if (nvalues > 0 && pool_size > 0) {
     cuda_sparse_coo_softmax_kernel<scalar_t, LogSoftMax>
         <<<grid_size, block_size, 0, stream>>>(
-            sorted_indices.data_ptr<int64_t>(),
+            sorted_indices.template data_ptr<int64_t>(),
             pool_size,
-            pool_sizes.data_ptr<int64_t>(),
-            pool_offsets.data_ptr<int64_t>(),
+            pool_sizes.template data_ptr<int64_t>(),
+            pool_offsets.template data_ptr<int64_t>(),
             nvalues,
-            mx_buffer.data_ptr<scalar_t>(),
+            mx_buffer.template data_ptr<scalar_t>(),
             values_accessor,
             out_values_accessor);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -557,13 +541,9 @@ void cuda_sparse_coo_softmax_backward(
       thrust_ptr(out_offsets.data_ptr<int64_t>()) + out_offsets.size(0),
       thrust_ptr(lower_bound_values.data_ptr<int64_t>()));
 
-  Tensor sorted_indices;
-  Tensor pool_offsets;
-  Tensor pool_sizes;
-
   /* Compute independent pools of indices */
-  std::tie(
-      sorted_indices, pool_offsets, pool_sizes, std::ignore) =
+  auto [
+      sorted_indices, pool_offsets, pool_sizes, _] =
       compute_pool_max<scalar_t, false>(
           out_indices, values_2, sizes, nvalues, dim);
 
@@ -575,10 +555,10 @@ void cuda_sparse_coo_softmax_backward(
   if (nvalues > 0 && pool_size > 0) {
     cuda_sparse_coo_softmax_backward_kernel<scalar_t, LogSoftMax>
         <<<grid_size, block_size, 0, stream>>>(
-            sorted_indices.data_ptr<int64_t>(),
+            sorted_indices.template data_ptr<int64_t>(),
             pool_size,
-            pool_sizes.data_ptr<int64_t>(),
-            pool_offsets.data_ptr<int64_t>(),
+            pool_sizes.template data_ptr<int64_t>(),
+            pool_offsets.template data_ptr<int64_t>(),
             nvalues,
             grad_nnz,
             grad_offsets.data_ptr<int64_t>(),

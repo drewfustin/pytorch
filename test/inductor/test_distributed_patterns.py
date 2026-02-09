@@ -7,8 +7,9 @@ from torch import nn
 from torch._dynamo import compiled_autograd
 from torch._dynamo.test_case import run_tests, TestCase
 from torch._dynamo.testing import CompileCounter
-from torch.testing._internal.common_utils import IS_MACOS, skipIfRocm
-from torch.testing._internal.inductor_utils import HAS_CPU, requires_gpu
+from torch.testing._internal.common_utils import IS_MACOS
+from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_CPU, requires_gpu
+
 
 # Fake distributed
 WORLD_SIZE = 2
@@ -25,23 +26,15 @@ def init_fake_distributed(device="cpu"):
         return t.narrow(0, 0, t.size(0) // WORLD_SIZE).clone()
 
     def fw_pre_hook(mod, inp):
-        if not compiled_autograd.compiled_autograd_enabled:
-            # torch.ops.fsdp.set_ doesn't work well in eager mode, so use the slow copy_ path instead.
-            mod.unsharded_weight.untyped_storage().resize_(
-                mod.unsharded_weight.nelement() * mod.unsharded_weight.element_size()
-            )
-            with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(
-                mod.unsharded_weight
-            ):
-                mod.unsharded_weight.copy_(all_gather(mod.sharded_weight))
-        else:
-            with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(
-                mod.unsharded_weight
-            ):
-                torch.ops.fsdp.set_(
-                    mod.unsharded_weight, all_gather(mod.sharded_weight)
-                )
-        mod.weight = mod.unsharded_weight
+        mod.unsharded_weight.untyped_storage().resize_(
+            mod.unsharded_weight.nelement() * mod.unsharded_weight.element_size()
+        )
+        with (
+            torch.no_grad(),
+            torch.autograd._unsafe_preserve_version_counter(mod.unsharded_weight),
+        ):
+            torch.ops.fsdp.copy_(mod.unsharded_weight, all_gather(mod.sharded_weight))
+        mod._parameters["weight"] = mod.unsharded_weight
 
     # Forward:
     #   mod.sharded_weight = local_shard (always)
@@ -53,27 +46,19 @@ def init_fake_distributed(device="cpu"):
     #     mod.unsharded_weight = zero-sized allgather
 
     def fw_post_hook(mod, inp, out):
-        mod.weight = mod.sharded_weight
+        mod._parameters["weight"] = mod.sharded_weight
         mod.unsharded_weight.untyped_storage().resize_(0)
 
     def bw_pre_hook(mod, gO):
-        if not compiled_autograd.compiled_autograd_enabled:
-            # torch.ops.fsdp.set_ doesn't work well in eager mode, so use the slow copy_ path instead.
-            mod.unsharded_weight.untyped_storage().resize_(
-                mod.unsharded_weight.nelement() * mod.unsharded_weight.element_size()
-            )
-            with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(
-                mod.unsharded_weight
-            ):
-                mod.unsharded_weight.copy_(all_gather(mod.sharded_weight))
-        else:
-            with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(
-                mod.unsharded_weight
-            ):
-                torch.ops.fsdp.set_(
-                    mod.unsharded_weight, all_gather(mod.sharded_weight)
-                )
-        mod.weight = mod.unsharded_weight
+        mod.unsharded_weight.untyped_storage().resize_(
+            mod.unsharded_weight.nelement() * mod.unsharded_weight.element_size()
+        )
+        with (
+            torch.no_grad(),
+            torch.autograd._unsafe_preserve_version_counter(mod.unsharded_weight),
+        ):
+            torch.ops.fsdp.copy_(mod.unsharded_weight, all_gather(mod.sharded_weight))
+        mod._parameters["weight"] = mod.unsharded_weight
 
     # Backward:
     #   mod.sharded_weight = local_shard (always)
@@ -87,7 +72,7 @@ def init_fake_distributed(device="cpu"):
     def bw_post_hook(mod, gI, gO):
         grad = mod.weight.grad
         new_grad = reduce_scatter(grad)
-        mod.weight = mod.sharded_weight
+        mod._parameters["weight"] = mod.sharded_weight
         mod.weight.grad = new_grad
         mod.unsharded_weight.untyped_storage().resize_(0)
 
@@ -98,7 +83,6 @@ def init_fake_distributed(device="cpu"):
     m.sharded_weight = nn.Parameter(reduce_scatter(m.weight))
     m.unsharded_weight = nn.Parameter(all_gather(m.sharded_weight))
     m.unsharded_weight.untyped_storage().resize_(0)
-    del m.weight
 
     m.register_full_backward_pre_hook(bw_pre_hook)
     m.register_full_backward_hook(bw_post_hook)
@@ -160,7 +144,44 @@ class DistributedPatternTests(TestCase):
         fn(x0, obj1).sum().backward()
         fn(x1, obj2).sum().backward()
 
-        with compiled_autograd.enable(functools.partial(torch.compile, fullgraph=True)):
+        with compiled_autograd._enable(
+            functools.partial(torch.compile, fullgraph=True)
+        ):
+            opt(x2, obj1).sum().backward()
+            opt(x3, obj2).sum().backward()
+
+        self.assertEqual(x0.grad, x2.grad)
+        self.assertEqual(x1.grad, x3.grad)
+
+    def test_intermediate_hook_with_nested_closure(self):
+        @dataclasses.dataclass
+        class CustomObj:
+            val: torch.Tensor
+
+        def fn(x, obj):
+            def run():
+                y = x.sin()
+                closure_var = y + 1
+                y.register_hook(lambda grad: grad + obj.val + closure_var)
+                z = y.sin()
+                return z
+
+            return run()
+
+        opt = torch.compile(fn, fullgraph=True)
+
+        obj1 = CustomObj(torch.tensor(88))
+        obj2 = CustomObj(torch.tensor(99))
+        x0 = torch.ones(4, requires_grad=True)
+        x1 = torch.ones(4, requires_grad=True)
+        x2 = torch.ones(4, requires_grad=True)
+        x3 = torch.ones(4, requires_grad=True)
+        fn(x0, obj1).sum().backward()
+        fn(x1, obj2).sum().backward()
+
+        with compiled_autograd._enable(
+            functools.partial(torch.compile, fullgraph=True)
+        ):
             opt(x2, obj1).sum().backward()
             opt(x3, obj2).sum().backward()
 
@@ -184,10 +205,9 @@ class DistributedPatternTests(TestCase):
     def test_storage_resize_zero_cpu(self):
         self._test_storage_resize_zero("cpu")
 
-    @skipIfRocm
     @requires_gpu()
-    def test_storage_resize_zero_cuda(self):
-        self._test_storage_resize_zero("cuda")
+    def test_storage_resize_zero_gpu(self):
+        self._test_storage_resize_zero(GPU_TYPE)
 
     @torch.no_grad()
     def _test_storage_resize_nonzero(self, device):
@@ -209,10 +229,9 @@ class DistributedPatternTests(TestCase):
     def test_storage_resize_nonzero_cpu(self):
         self._test_storage_resize_nonzero("cpu")
 
-    @skipIfRocm
     @requires_gpu()
-    def test_storage_resize_nonzero_cuda(self):
-        self._test_storage_resize_nonzero("cuda")
+    def test_storage_resize_nonzero_gpu(self):
+        self._test_storage_resize_nonzero(GPU_TYPE)
 
     @torch.no_grad()
     def test_unsafe_set_version_counter1(self):
@@ -223,7 +242,7 @@ class DistributedPatternTests(TestCase):
             x = x.sin()
             v = w._version
             w.copy_(x + 1)
-            torch._C._autograd._unsafe_set_version_counter(w, v)
+            torch._C._autograd._unsafe_set_version_counter((w,), (v,))
             return w, v
 
         for v in (3, 0, 1):
@@ -247,7 +266,7 @@ class DistributedPatternTests(TestCase):
             with torch.no_grad():
                 v = w._version
                 w.copy_(x)
-                torch._C._autograd._unsafe_set_version_counter(w, v)
+                torch._C._autograd._unsafe_set_version_counter((w,), (v,))
             return r
 
         w1 = torch.randn(1, requires_grad=True)
@@ -304,7 +323,7 @@ class DistributedPatternTests(TestCase):
         m2, inp2 = init_module_bw_hooks(False)
         fw_cnt = CompileCounter()
         bw_cnt = CompileCounter()
-        with compiled_autograd.enable(torch.compile(backend=bw_cnt, fullgraph=True)):
+        with compiled_autograd._enable(torch.compile(backend=bw_cnt, fullgraph=True)):
             m2 = torch.compile(m2, backend=fw_cnt, fullgraph=True)
             out2 = steps(m2, inp2)
 
@@ -318,7 +337,9 @@ class DistributedPatternTests(TestCase):
         self.assertEqual(fw_cnt.frame_count, 1)
         self.assertEqual(fw_cnt.op_count, 5)
         self.assertEqual(bw_cnt.frame_count, 2)  # grad=None and grad!=None
-        self.assertEqual(bw_cnt.op_count, 48)
+        self.assertEqual(
+            bw_cnt.op_count, 111
+        )  # Number of ops in the Dynamo-produced graphs
 
     def test_module_backward_hooks_aot(self):
         m1, inp1 = init_module_bw_hooks(True)
@@ -326,7 +347,7 @@ class DistributedPatternTests(TestCase):
 
         m2, inp2 = init_module_bw_hooks(True)
         m2 = torch.compile(m2, backend="aot_eager", fullgraph=True)
-        with compiled_autograd.enable(lambda gm: gm):
+        with compiled_autograd._enable(lambda gm: gm):
             out2 = steps(m2, inp2)
 
         self.assertEqual(m1.hook_count_pre, m2.hook_count_pre)
@@ -342,7 +363,7 @@ class DistributedPatternTests(TestCase):
 
         m2, inp2 = init_module_bw_hooks(False)
         m2 = torch.compile(m2, fullgraph=True)
-        with compiled_autograd.enable(torch.compile(fullgraph=True)):
+        with compiled_autograd._enable(torch.compile(fullgraph=True)):
             out2 = steps(m2, inp2)
 
         self.assertEqual(m1.hook_count_pre, m2.hook_count_pre)
@@ -359,7 +380,7 @@ class DistributedPatternTests(TestCase):
 
         a2, inp2 = init_module_bw_hooks(False)
         b2, _ = init_module_bw_hooks(False)
-        with compiled_autograd.enable(torch.compile(fullgraph=True)):
+        with compiled_autograd._enable(torch.compile(fullgraph=True)):
             out2 = steps(
                 torch.compile(torch.nn.Sequential(a2, b2), fullgraph=True), inp2
             )
@@ -413,6 +434,7 @@ class DistributedPatternTests(TestCase):
         self._assert_same_grad(r1, r2)
         self._assert_same_grad(p1, p2)
 
+    @torch._dynamo.config.patch("graph_break_on_nn_param_ctor", False)
     def test_nn_param_return3(self):
         def fn(x):
             p = torch.nn.Parameter(x + 123)
@@ -429,6 +451,7 @@ class DistributedPatternTests(TestCase):
         self._assert_same_grad(r1, r2)
         self._assert_same_grad(p1, p2)
 
+    @torch._dynamo.config.patch("graph_break_on_nn_param_ctor", False)
     def test_nn_param_return4(self):
         def fn(x):
             p = torch.nn.Parameter(x + 123, requires_grad=False)
@@ -451,7 +474,7 @@ class DistributedPatternTests(TestCase):
         m2, inp2 = init_fake_distributed()
         m2 = torch.compile(m2, backend="aot_eager", fullgraph=True)
         bw_cnt = CompileCounter()
-        with compiled_autograd.enable(torch.compile(backend=bw_cnt, fullgraph=True)):
+        with compiled_autograd._enable(torch.compile(backend=bw_cnt, fullgraph=True)):
             out2 = steps(m2, inp2)
 
         self._assert_same_grad(m1.weight, m2.weight)
@@ -460,17 +483,15 @@ class DistributedPatternTests(TestCase):
         # Recompile on grad==None/grad!=None
         self.assertEqual(bw_cnt.frame_count, 2)
 
-    @skipIfRocm
     @requires_gpu()
     @torch._functorch.config.patch(recompute_views=True)
     def test_fake_distributed_inductor(self):
-        # TODO: fix .set_ lowering in CPU inductor, and enable the CPU test.
-        m1, inp1 = init_fake_distributed("cuda")
+        m1, inp1 = init_fake_distributed(GPU_TYPE)
         out1 = steps(m1, inp1)
 
-        m2, inp2 = init_fake_distributed("cuda")
+        m2, inp2 = init_fake_distributed(GPU_TYPE)
         m2 = torch.compile(m2, fullgraph=True)
-        with compiled_autograd.enable(torch.compile(fullgraph=True)):
+        with compiled_autograd._enable(torch.compile(fullgraph=True)):
             out2 = steps(m2, inp2)
 
         self._assert_same_grad(m1.weight, m2.weight)

@@ -1,4 +1,5 @@
 # Owner(s): ["module: fx.passes"]
+# ruff: noqa: F841
 
 from dataclasses import dataclass
 import operator
@@ -20,7 +21,7 @@ logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 class TestModule(torch.nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.linear = torch.nn.Linear(4, 4)
         self.linear2 = torch.nn.Linear(4, 4)
@@ -45,7 +46,7 @@ class TestModule(torch.nn.Module):
         return add_4, add_6, relu
 
 class TestDeepModule(torch.nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.linear = torch.nn.Linear(4, 4)
 
@@ -109,7 +110,7 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward6(a, b, c):
-        # add should have its own partition, as neither branchs are supported
+        # add should have its own partition, as neither branches are supported
         add = a + 1
         # left branch
         relu = add.relu()
@@ -239,6 +240,28 @@ class TestPartitionFunctions:
         a0, a1 = torch.ops.aten.var_mean(a)
         return a0
 
+@torch.fx.wrap
+def _nested_tuple_producer(x):
+    """Returns a nested tuple structure: (x+1, (x+2, x+3))"""
+    return (x + 1, (x + 2, x + 3))
+
+
+class TestNestedGetitemFunctions:
+    """Test functions for nested getitem chain handling in partitioner."""
+
+    @staticmethod
+    def forward_nested_getitem_cross_partition(a, b, c):
+        result = _nested_tuple_producer(a)
+        outer_0 = result[0]
+        inner_tuple = result[1]
+        inner_0 = inner_tuple[0]
+        # UNSUPPORTED operation (relu) - this creates a partition boundary
+        # the getitem chain should still be reassigned to producer's partition
+        blocked = outer_0.relu()
+        # downstream use that crosses partition boundary
+        return inner_0 + blocked + b
+
+
 # A mock OperatorSupport class, where only operator.add is supported
 class MockOperatorSupport(OperatorSupport):
     def is_node_supported(self, submodules, node: torch.fx.Node) -> bool:
@@ -246,7 +269,8 @@ class MockOperatorSupport(OperatorSupport):
                 node.target in {operator.add, operator.getitem,
                                 torch.ops.aten.view,
                                 torch.ops.aten.permute,
-                                torch.ops.aten.std_mean})
+                                torch.ops.aten.std_mean,
+                                _nested_tuple_producer})
 
 @instantiate_parametrized_tests
 class TestFXGraphPasses(JitTestCase):
@@ -282,7 +306,7 @@ class TestFXGraphPasses(JitTestCase):
         (TestPartitionFunctions.forward15, [['add_1', 'add', 'permute_1', 'view', 'permute_2', 'permute_3', 'permute']], False),
         (TestPartitionFunctions.forward16, [["permute_1", "add_1", "add"]], True),
         (TestPartitionFunctions.forward16, [['add_1', 'add', 'permute_1', 'view', 'permute_2', 'permute_3', 'permute']], False),
-        # should be empty partition, not a partiton with empty nodes
+        # should be empty partition, not a partition with empty nodes
         (TestPartitionFunctions.forward18, [], False),
     ])
     def test_partitioner(self, fn, expected_partition, bookend_non_compute_pass):
@@ -302,9 +326,11 @@ class TestFXGraphPasses(JitTestCase):
             partitioner.remove_bookend_non_compute_ops(partitions)
 
         partitions_name = [[node.name for node in partition.nodes] for partition in partitions]
-        assert len(partitions_name) == len(expected_partition)
+        if len(partitions_name) != len(expected_partition):
+            raise AssertionError(f"partition count mismatch: {len(partitions_name)} != {len(expected_partition)}")
         for i in range(len(partitions_name)):
-            assert set(partitions_name[i]) == set(expected_partition[i])
+            if set(partitions_name[i]) != set(expected_partition[i]):
+                raise AssertionError(f"partition {i} mismatch: {set(partitions_name[i])} != {set(expected_partition[i])}")
 
         fused_graph = partitioner.fuse_partitions(partitions)
 
@@ -326,9 +352,11 @@ class TestFXGraphPasses(JitTestCase):
                                                  allows_single_node_partition=True)
         partitions = partitioner.propose_partitions()
         partitions_name = [[node.name for node in partition.nodes] for partition in partitions]
-        assert len(partitions_name) == len(expected_partition)
+        if len(partitions_name) != len(expected_partition):
+            raise AssertionError(f"partition count mismatch: {len(partitions_name)} != {len(expected_partition)}")
         for i in range(len(partitions_name)):
-            assert set(partitions_name[i]) == set(expected_partition[i])
+            if set(partitions_name[i]) != set(expected_partition[i]):
+                raise AssertionError(f"partition {i} mismatch: {set(partitions_name[i])} != {set(expected_partition[i])}")
 
         fused_graph = partitioner.fuse_partitions(partitions)
 
@@ -343,9 +371,9 @@ class TestFXGraphPasses(JitTestCase):
         [['add', 'add_1', 'add_2']],  # vertical fusion
         [['add_2', 'add_3']],         # horizontal fusion
         [['add_3', 'add_4']],
-        [['add_6', 'add_5']],     # arbitray node order
-        [['add_4', 'add_1', 'add_3', 'add_2']],           # arbitray node order
-        [['add_5', 'add_6'], ['add_1', 'add_2', 'add_3', 'add_4']],  # arbitray partition order
+        [['add_6', 'add_5']],     # arbitrary node order
+        [['add_4', 'add_1', 'add_3', 'add_2']],           # arbitrary node order
+        [['add_5', 'add_6'], ['add_1', 'add_2', 'add_3', 'add_4']],  # arbitrary partition order
         [['add_5', 'linear2']],   # includes call_function + call_module node
         [['add_6', 'relu']],   # includes call_function + call_module node
         [['param', 'add_2']],   # includes get_attr + call_module nodes
@@ -360,7 +388,7 @@ class TestFXGraphPasses(JitTestCase):
 
         partitions = []
         for node_names in partition:
-            partitions.append([nodes_by_name[name] for name in node_names])
+            partitions.append(dict.fromkeys([nodes_by_name[name] for name in node_names]))
 
         fused_graph = fuse_by_partitions(gm, partitions)
 
@@ -385,7 +413,7 @@ class TestFXGraphPasses(JitTestCase):
 
         partitions = []
         for node_names in partition:
-            partitions.append([nodes_by_name[name] for name in node_names])
+            partitions.append(dict.fromkeys([nodes_by_name[name] for name in node_names]))
 
         with self.assertRaises(Exception):
             fuse_by_partitions(gm, partitions)
@@ -399,6 +427,77 @@ class TestFXGraphPasses(JitTestCase):
                                                  supported_ops,
                                                  allows_single_node_partition=True)
         partitions = partitioner.propose_partitions()
+
+    def test_partitioner_nested_getitem_chains(self):
+        """Test that nested getitem chains are properly reassigned to producer's partition.
+
+        this tests the fix for handling patterns like:
+            producer_node = call(...)  # returns ((a, b), c)
+            getitem_1 = producer_node[0]  # gets (a, b)
+            getitem_2 = getitem_1[0]  # gets a
+
+        without the iterative fix, getitem_2 would be assigned to getitem_1's original
+        partition instead of the producer's partition.
+        """
+        traced = symbolic_trace(TestNestedGetitemFunctions.forward_nested_getitem_cross_partition)
+
+        supported_ops = MockOperatorSupport()
+        partitioner = CapabilityBasedPartitioner(
+            traced,
+            supported_ops,
+            allows_single_node_partition=True
+        )
+        partitions = partitioner.propose_partitions()
+
+        node_to_partition: dict[torch.fx.Node, int] = {}
+        for idx, partition in enumerate(partitions):
+            for node in partition.nodes:
+                node_to_partition[node] = idx
+
+        producer_node = None
+        getitem_nodes = []
+        for node in traced.graph.nodes:
+            if node.op == "call_function":
+                if node.target == _nested_tuple_producer:
+                    producer_node = node
+                elif node.target == operator.getitem:
+                    getitem_nodes.append(node)
+
+        self.assertIsNotNone(producer_node, "Should find the nested tuple producer node")
+        self.assertGreaterEqual(len(getitem_nodes), 3, "Should find at least 3 getitem nodes")
+
+        # all getitems that derive from the producer (including nested ones)
+        # should be in the same partition as the producer
+        if producer_node in node_to_partition:
+            producer_partition = node_to_partition[producer_node]
+
+            for getitem_node in getitem_nodes:
+                current = getitem_node.args[0]
+                derives_from_producer = False
+                while hasattr(current, 'op'):
+                    if current == producer_node:
+                        derives_from_producer = True
+                        break
+                    if current.op == "call_function" and current.target == operator.getitem:
+                        current = current.args[0]
+                    else:
+                        break
+
+                if derives_from_producer:
+                    getitem_partition = node_to_partition.get(getitem_node)
+                    self.assertEqual(
+                        getitem_partition,
+                        producer_partition,
+                        f"Getitem node '{getitem_node.name}' (nested in chain from producer) "
+                        f"should be in same partition as producer. "
+                        f"Got partition {getitem_partition}, expected {producer_partition}"
+                    )
+
+        fused_graph = partitioner.fuse_partitions(partitions)
+        a, b, c = torch.rand(4), torch.rand(4), torch.rand(4)
+        expected = TestNestedGetitemFunctions.forward_nested_getitem_cross_partition(a, b, c)
+        result = fused_graph(a, b, c)
+        torch.testing.assert_close(expected, result)
 
 @dataclass
 class TestCase:
@@ -849,7 +948,8 @@ class TestFXMatcherUtils(JitTestCase):
                                       remove_overlapping_matches=test_case.remove_overlapping_matches)
             matches = matcher.match(traced.graph)
 
-            assert len(matches) == test_case.num_matches
+            if len(matches) != test_case.num_matches:
+                raise AssertionError(f"match count mismatch: {len(matches)} != {test_case.num_matches}")
 
             for match in matches:
                 for node in pattern_traced.graph.nodes:
@@ -857,7 +957,8 @@ class TestFXMatcherUtils(JitTestCase):
                         continue
                     if not test_case.match_output and node.op == "output":
                         continue
-                    assert node in match.nodes_map
+                    if node not in match.nodes_map:
+                        raise AssertionError(f"node {node} not in match.nodes_map")
 
         tearDown = getattr(test_model, "tearDown", None)
         if callable(setup):

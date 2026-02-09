@@ -5,7 +5,9 @@
 #include <ATen/Tensor.h>
 #include <ATen/native/quantized/PackedParams.h>
 #include <ideep.hpp>
+#if !defined(__powerpc__)
 #include <cpuinfo.h>
+#endif
 
 #include <c10/util/CallOnce.h>
 
@@ -46,7 +48,7 @@ using DeconvDesc = dnnl::deconvolution_forward::primitive_desc;
 using DeconvParams = ideep::deconv_forward_params;
 
 struct LinearPrimitiveCache : PrimitiveCache {
-  LinearPrimitiveCache() {}
+  LinearPrimitiveCache() = default;
 
   LinearPrimitiveCache(
       const PrimitiveCacheKey& key,
@@ -61,8 +63,8 @@ struct LinearPrimitiveCache : PrimitiveCache {
   // are set at execution time. So we only need to compare
   // the rest part of key.
   bool hit_dynamic(const PrimitiveCacheKey& new_key) {
-    auto cached_input_shape = std::get<InputShape>(this->key);
-    auto new_input_shape = std::get<InputShape>(new_key);
+    auto const& cached_input_shape = std::get<InputShape>(this->key);
+    auto const& new_input_shape = std::get<InputShape>(new_key);
     return (
         cached_input_shape == new_input_shape &&
         std::get<NumOfThreads>(this->key) == std::get<NumOfThreads>(new_key));
@@ -74,7 +76,7 @@ struct LinearPrimitiveCache : PrimitiveCache {
 };
 
 struct ConvPrimitiveCache : PrimitiveCache {
-  ConvPrimitiveCache() {}
+  ConvPrimitiveCache() = default;
 
   ConvPrimitiveCache(
       const PrimitiveCacheKey& key,
@@ -91,7 +93,7 @@ struct ConvPrimitiveCache : PrimitiveCache {
 };
 
 struct DeconvPrimitiveCache : PrimitiveCache {
-  DeconvPrimitiveCache() {}
+  DeconvPrimitiveCache() = default;
 
   DeconvPrimitiveCache(
       const PrimitiveCacheKey& key,
@@ -310,14 +312,14 @@ struct PackedConvWeightsOnednn : public ConvPackedParamsBase<kSpatialDim> {
 namespace onednn_utils {
 
 inline ideep::attr_t create_attr_by_post_op(
-    const c10::string_view& binary_post_op,
+    const std::string_view& binary_post_op,
     double binary_alpha,
     double input1_scale,
     int64_t input1_zero_point,
     const ideep::tensor::desc& input1_desc,
-    const c10::string_view& unary_post_op,
+    const std::string_view& unary_post_op,
     const torch::List<std::optional<at::Scalar>>& unary_post_op_args,
-    const c10::string_view& unary_post_op_algorithm) {
+    const std::string_view& unary_post_op_algorithm) {
   using ideep::tensor;
   if (binary_post_op == "none") {
     if (unary_post_op == "relu") {
@@ -432,7 +434,11 @@ inline bool should_use_onednn_quant(
 #if !defined(__linux__)
   return false;
 #else
-  bool vnni_available = cpuinfo_has_x86_avx512vnni();
+#if defined(__powerpc__)
+  constexpr auto vnni_available = true;
+#else
+  const auto vnni_available = cpuinfo_has_x86_avx512vnni();
+#endif
   bool w_sym_quant =
       is_weight_symmetric_quant(weight, is_transposed_conv);
   bool opad_all_zero =
@@ -452,6 +458,47 @@ at::Tensor _qconv_prepack_onednn(
     torch::List<int64_t> padding,
     torch::List<int64_t> dilation,
     int64_t groups,
-    std::optional<torch::List<int64_t>> input_shape=c10::nullopt);
+    std::optional<torch::List<int64_t>> input_shape=std::nullopt);
+
+#define FP8E4M3_MAX 448.0
+
+#define CACHE_ONEDNN_CONTEXT_FLAG "ONEDNN_CACHE_CONTEXT_UNSAFE"
+#if IDEEP_PREREQ(3, 9, 0, 0)
+#define ONEDNN_FP8_QCONV_SUPPORTED
+#endif
+
+struct QlinearForwardParams {
+  dnnl::matmul primitive;
+  ideep::exec_args args;
+  ideep::tensor packed_weight;
+  ideep::tensor weight_scales;
+  std::optional<ideep::tensor> src_scale;
+  std::optional<ideep::tensor> src_zero_point;
+  std::optional<ideep::tensor> dst_scale;
+  std::optional<ideep::tensor> dst_zero_point;
+  std::optional<ideep::tensor> bias;
+  ideep::tensor scratchpad;
+
+  void init_args() {
+    args.insert({DNNL_ARG_WEIGHTS, packed_weight});
+    args.insert({DNNL_ARG_SCRATCHPAD, scratchpad});
+    if (bias.has_value()) {
+      args.insert({DNNL_ARG_BIAS, bias.value()});
+    }
+    if (src_scale.has_value()) {
+      args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, src_scale.value()});
+    }
+    if (dst_scale.has_value()) {
+      args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, dst_scale.value()});
+    }
+    args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, weight_scales});
+    if (src_zero_point.has_value()) {
+      args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_SRC, src_zero_point.value()});
+    }
+    if (dst_zero_point.has_value()) {
+      args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_DST, dst_zero_point.value()});
+    }
+  }
+};
 
 #endif // #if AT_MKLDNN_ENABLED()

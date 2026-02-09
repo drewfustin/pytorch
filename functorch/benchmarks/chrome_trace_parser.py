@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 import argparse
 import logging
-
 import os
 
 import pandas as pd
 
 from torch._functorch.benchmark_utils import compute_utilization
+
+
+log = logging.getLogger(__name__)
 
 # process the chrome traces output by the pytorch profiler
 # require the json input file's name to be in format {model_name}_chrome_trace_*.json
@@ -64,8 +66,8 @@ def main():
                 filenames, total_length
             )
             print(f"{modelname}, {utilization}, {mm_conv_utilization}")
-        except BaseException:
-            logging.exception("%s, ERROR", filename)
+        except BaseException:  # noqa: B036
+            log.exception("%s, ERROR", filename)
             print(f"{filename}, ERROR")
 
 

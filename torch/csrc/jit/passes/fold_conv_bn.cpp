@@ -10,7 +10,6 @@
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
 #else
-#include <ATen/ops/empty_like.h>
 #include <ATen/ops/ones_like.h>
 #include <ATen/ops/rsqrt.h>
 #include <ATen/ops/zeros_like.h>
@@ -19,8 +18,7 @@
 #include <stack>
 #include <utility>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 std::tuple<at::Tensor, at::Tensor> computeUpdatedConvWeightAndBias(
     const ConvBNParameters& p) {
@@ -407,5 +405,4 @@ graph(%self, %input, %conv, %batchnorm):
   return m;
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

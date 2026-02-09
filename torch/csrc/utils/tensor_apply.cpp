@@ -1,11 +1,9 @@
 #include <torch/csrc/utils/tensor_apply.h>
 
 #include <ATen/ExpandUtils.h>
-#include <ATen/TensorUtils.h>
 #include <c10/util/irange.h>
 
 #include <torch/csrc/Exceptions.h>
-#include <torch/csrc/utils/python_numbers.h>
 #include <torch/csrc/utils/python_scalars.h>
 
 using namespace at;
@@ -53,8 +51,7 @@ static void recursive_apply(
   }
 
   auto n = sizes[dim];
-  for (const auto i : c10::irange(n)) {
-    (void)i; // Suppress unused variable warning
+  for ([[maybe_unused]] const auto i : c10::irange(n)) {
     recursive_apply(sizes, scalarType, dim + 1, fn, strided_data);
     for (auto& td : strided_data) {
       td.step(dim);

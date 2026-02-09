@@ -16,7 +16,7 @@ class TensorBase;
 // actually exists outside of c10 and needs to be moved in.
 
 // TensorImpl has a unique_ptr<NamedTensorMetaInterface> field.
-// XXX: Ideally we would just put optional<vector<Dimname>> into TensorImpl.
+// XXX: Ideally we would just put std::optional<vector<Dimname>> into TensorImpl.
 //
 // This class has an important invariant: there must be at least ONE
 // non-wildcard
@@ -27,11 +27,11 @@ struct TORCH_API NamedTensorMeta final : public c10::NamedTensorMetaInterface {
     HasNonWildcard
   };
 
-  explicit NamedTensorMeta(HAS_NON_WILDCARD, DimnameList names)
+  explicit NamedTensorMeta(HAS_NON_WILDCARD /*unused*/, DimnameList names)
     : names_(names.vec()) {
     check_invariants();
   }
-  explicit NamedTensorMeta(HAS_NON_WILDCARD, std::vector<Dimname>&& names)
+  explicit NamedTensorMeta(HAS_NON_WILDCARD /*unused*/, std::vector<Dimname>&& names)
     : names_(std::move(names)) {
     check_invariants();
   }
@@ -52,13 +52,13 @@ struct TORCH_API NamedTensorMeta final : public c10::NamedTensorMetaInterface {
       std::any_of(names_.begin(), names_.end(), [](const Dimname& n) { return !n.isWildcard(); }));
   }
 
-  void set_names(HAS_NON_WILDCARD, DimnameList new_names) {
+  void set_names(HAS_NON_WILDCARD /*unused*/, DimnameList new_names) {
     TORCH_INTERNAL_ASSERT(new_names.size() == names_.size());
     std::copy(new_names.begin(), new_names.end(), names_.begin());
     check_invariants();
   }
 
-  void set_names(HAS_NON_WILDCARD, std::vector<Dimname>&& new_names) {
+  void set_names(HAS_NON_WILDCARD /*unused*/, std::vector<Dimname>&& new_names) {
     TORCH_INTERNAL_ASSERT(new_names.size() == names_.size());
     names_ = std::move(new_names);
     check_invariants();
@@ -82,6 +82,10 @@ struct TORCH_API NoNamesGuard {
   NoNamesGuard() : prev_mode(NamesMode::is_enabled()) {
     NamesMode::set_enabled(false);
   }
+  NoNamesGuard(const NoNamesGuard&) = delete;
+  NoNamesGuard(NoNamesGuard&&) = delete;
+  NoNamesGuard& operator=(const NoNamesGuard&) = delete;
+  NoNamesGuard& operator=(NoNamesGuard&&) = delete;
   ~NoNamesGuard() {
     if (initialized) {
       reset();

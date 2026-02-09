@@ -1,4 +1,5 @@
 # Owner(s): ["module: fft"]
+# ruff: noqa: F841
 
 import torch
 import unittest
@@ -17,10 +18,9 @@ from torch.testing._internal.common_device_type import \
      skipCPUIfNoFFT, deviceCountAtLeast, onlyCUDA, OpDTypes, skipIf, toleranceOverride, tol)
 from torch.testing._internal.common_methods_invocations import (
     spectral_funcs, SpectralFuncType)
-from torch.testing._internal.common_cuda import SM53OrLater
 from torch._prims_common import corresponding_complex_dtype
 
-from typing import Optional, List
+from typing import Optional
 from packaging import version
 
 
@@ -59,20 +59,22 @@ def _hermitian_conj(x, dim):
     """
     out = torch.empty_like(x)
     mid = (x.size(dim) - 1) // 2
-    idx = [slice(None)] * out.dim()
-    idx_center = list(idx)
-    idx_center[dim] = 0
+    idx = tuple([slice(None)] * out.dim())
     out[idx] = x[idx]
 
     idx_neg = list(idx)
     idx_neg[dim] = slice(-mid, None)
-    idx_pos = idx
+    idx_neg = tuple(idx_neg)
+    idx_pos = list(idx)
     idx_pos[dim] = slice(1, mid + 1)
+    idx_pos = tuple(idx_pos)
 
     out[idx_pos] = x[idx_neg].flip(dim)
     out[idx_neg] = x[idx_pos].flip(dim)
     if (2 * mid + 1 < x.size(dim)):
+        idx = list(idx)
         idx[dim] = mid + 1
+        idx = tuple(idx)
         out[idx] = x[idx]
     return out.conj()
 
@@ -120,8 +122,6 @@ def skip_helper_for_fft(device, dtype):
 
     if device_type == 'cpu':
         raise unittest.SkipTest("half and complex32 are not supported on CPU")
-    if not SM53OrLater:
-        raise unittest.SkipTest("half and complex32 are only supported on CUDA device with SM>53")
 
 
 # Tests of functions related to Fourier analysis in the torch.fft namespace
@@ -326,8 +326,6 @@ class TestFFT(TestCase):
         default_msg = "Unsupported dtype"
         if dtype is torch.half and device_type == 'cuda' and TEST_WITH_ROCM:
             err_msg = default_msg
-        elif dtype is torch.half and device_type == 'cuda' and not SM53OrLater:
-            err_msg = "cuFFT doesn't support signals of half type with compute capability less than SM_53"
         else:
             err_msg = default_msg
         with self.assertRaisesRegex(RuntimeError, err_msg):
@@ -354,6 +352,9 @@ class TestFFT(TestCase):
     @unittest.skipIf(not TEST_NUMPY, 'NumPy not found')
     @ops([op for op in spectral_funcs if op.ndimensional == SpectralFuncType.ND],
          allowed_dtypes=(torch.cfloat, torch.cdouble))
+    @toleranceOverride({
+        torch.cfloat : tol(2e-4, 1.3e-6),
+    })
     def test_reference_nd(self, device, dtype, op):
         if op.ref is None:
             raise unittest.SkipTest("No reference implementation")
@@ -478,7 +479,7 @@ class TestFFT(TestCase):
             torch.fft.ifft2,
         ]:
             inp = make_tensor((10, 10), device=device, dtype=dtype)
-            out = torch.fft.fftn(inp, dim=[])
+            out = op(inp, dim=[])
 
             expect_dtype = RESULT_TYPE.get(inp.dtype, inp.dtype)
             expect = inp.to(expect_dtype)
@@ -517,6 +518,7 @@ class TestFFT(TestCase):
             lastdim_size = input.size(lastdim) // 2 + 1
             idx = [slice(None)] * input_ndim
             idx[lastdim] = slice(0, lastdim_size)
+            idx = tuple(idx)
             input = input[idx]
 
             s = [shape[dim] for dim in actual_dims]
@@ -557,6 +559,7 @@ class TestFFT(TestCase):
             lastdim_size = expect.size(lastdim) // 2 + 1
             idx = [slice(None)] * input_ndim
             idx[lastdim] = slice(0, lastdim_size)
+            idx = tuple(idx)
             expect = expect[idx]
 
             actual = torch.fft.ihfftn(input, dim=dim, norm="ortho")
@@ -596,7 +599,7 @@ class TestFFT(TestCase):
                 else:
                     numpy_fn = getattr(np.fft, fname)
 
-                def fn(t: torch.Tensor, s: Optional[List[int]], dim: List[int] = (-2, -1), norm: Optional[str] = None):
+                def fn(t: torch.Tensor, s: Optional[list[int]], dim: list[int] = (-2, -1), norm: Optional[str] = None):
                     return torch_fn(t, s, dim, norm)
 
                 torch_fns = (torch_fn, torch.jit.script(fn))
@@ -1225,6 +1228,14 @@ class TestFFT(TestCase):
         with self.assertRaisesRegex(RuntimeError, 'stft requires the return_complex parameter'):
             y = x.stft(10, pad_mode='constant')
 
+    @onlyNativeDeviceTypes
+    @skipCPUIfNoFFT
+    def test_stft_align_to_window_only_requires_non_center(self, device):
+        x = torch.rand(100)
+        for align_to_window in [True, False]:
+            with self.assertRaisesRegex(RuntimeError, 'stft align_to_window should only be set when center = false'):
+                y = x.stft(10, center=True, return_complex=True, align_to_window=align_to_window)
+
     # stft and istft are currently warning if a window is not provided
     @onlyNativeDeviceTypes
     @skipCPUIfNoFFT
@@ -1302,7 +1313,7 @@ class TestFFT(TestCase):
             istft_kwargs = stft_kwargs.copy()
             del istft_kwargs['pad_mode']
             for sizes in data_sizes:
-                for i in range(num_trials):
+                for _ in range(num_trials):
                     original = torch.randn(*sizes, dtype=dtype, device=device)
                     stft = torch.stft(original, return_complex=True, **stft_kwargs)
                     inversed = torch.istft(stft, length=original.size(1), **istft_kwargs)
@@ -1357,7 +1368,7 @@ class TestFFT(TestCase):
                 'onesided': True,
             },
         ]
-        for i, pattern in enumerate(patterns):
+        for pattern in patterns:
             _test_istft_is_inverse_of_stft(pattern)
 
     @onlyNativeDeviceTypes
@@ -1373,7 +1384,7 @@ class TestFFT(TestCase):
             del stft_kwargs['size']
             istft_kwargs = stft_kwargs.copy()
             del istft_kwargs['pad_mode']
-            for i in range(num_trials):
+            for _ in range(num_trials):
                 original = torch.randn(*sizes, dtype=dtype, device=device)
                 stft = torch.stft(original, return_complex=True, **stft_kwargs)
                 with self.assertWarnsOnceRegex(UserWarning, "The length of signal is shorter than the length parameter."):
@@ -1424,7 +1435,7 @@ class TestFFT(TestCase):
                 'onesided': True,
             },
         ]
-        for i, pattern in enumerate(patterns):
+        for pattern in patterns:
             _test_istft_is_inverse_of_stft_with_padding(pattern)
 
     @onlyNativeDeviceTypes
@@ -1488,7 +1499,7 @@ class TestFFT(TestCase):
         complex_dtype = corresponding_complex_dtype(dtype)
 
         def _test(data_size, kwargs):
-            for i in range(num_trials):
+            for _ in range(num_trials):
                 tensor1 = torch.randn(data_size, device=device, dtype=complex_dtype)
                 tensor2 = torch.randn(data_size, device=device, dtype=complex_dtype)
                 a, b = torch.rand(2, dtype=dtype, device=device)
@@ -1592,7 +1603,7 @@ class FFTDocTestFinder:
     '''The default doctest finder doesn't like that function.__module__ doesn't
     match torch.fft. It assumes the functions are leaked imports.
     '''
-    def __init__(self):
+    def __init__(self) -> None:
         self.parser = doctest.DocTestParser()
 
     def find(self, obj, name=None, module=None, globs=None, extraglobs=None):
